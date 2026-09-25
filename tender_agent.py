@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-STRUCTURAL-FIX-V3"
+CODE_VERSION = "2026-09-25-DISCOVERY-FIX-V4"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -120,7 +120,7 @@ MAX_DOC_TEXT_CHARS = int(
 MAX_GENERIC_LINKS = int(
     os.getenv(
         "MAX_GENERIC_LINKS",
-        "35",
+        "100",
     )
 )
 
@@ -496,15 +496,57 @@ def normalize_space(value):
     ).strip()
 
 
-def keyword_hits(text):
-    text_lower = (
+def contains_phrase(text, phrase):
+    """
+    Boundary-aware phrase matcher.
+
+    Prevents false positives such as:
+      "stall" matching "install"
+      "event" matching "events" only when not intended
+    while still supporting multi-word phrases.
+    """
+    haystack = normalize_space(
         text or ""
     ).lower()
 
+    needle = normalize_space(
+        phrase or ""
+    ).lower()
+
+    if not haystack or not needle:
+        return False
+
+    pattern = (
+        r"(?<![a-z0-9])"
+        + re.escape(needle)
+        + r"(?![a-z0-9])"
+    )
+
+    return re.search(
+        pattern,
+        haystack,
+        flags=re.I,
+    ) is not None
+
+
+def contains_any_phrase(text, phrases):
+    return any(
+        contains_phrase(
+            text,
+            phrase,
+        )
+        for phrase in phrases
+    )
+
+
+def keyword_hits(text):
     return [
         keyword
         for keyword in EVENT_KEYWORDS
-        if keyword.lower() in text_lower
+        if contains_phrase(
+            text,
+            keyword,
+        )
     ]
 
 
@@ -513,9 +555,9 @@ def infer_category(title):
         title or ""
     ).lower()
 
-    if any(
-        item in text
-        for item in [
+    if contains_any_phrase(
+        text,
+        [
             "exhibition stall",
             "exhibition pavilion",
             "stall design",
@@ -524,27 +566,41 @@ def infer_category(title):
             "pavilion fabrication",
             "expo",
             "trade fair",
-        ]
+        ],
     ):
         return "Exhibition / Stall"
 
-    if "empanel" in text and any(
-        item in text
-        for item in [
-            "event",
-            "exhibition",
-            "advertising",
-            "creative",
-            "publicity",
-            "media",
-            "communication",
-        ]
+    if (
+        (
+            contains_phrase(
+                text,
+                "empanelment",
+            )
+            or
+            contains_phrase(
+                text,
+                "empanel",
+            )
+        )
+        and
+        contains_any_phrase(
+            text,
+            [
+                "event",
+                "exhibition",
+                "advertising",
+                "creative",
+                "publicity",
+                "media",
+                "communication",
+            ],
+        )
     ):
         return "Empanelment"
 
-    if any(
-        item in text
-        for item in [
+    if contains_any_phrase(
+        text,
+        [
             "conference management",
             "organising conference",
             "organizing conference",
@@ -555,13 +611,13 @@ def infer_category(title):
             "conclave management",
             "organising conclave",
             "organizing conclave",
-        ]
+        ],
     ):
         return "Conference / Conclave"
 
-    if any(
-        item in text
-        for item in [
+    if contains_any_phrase(
+        text,
+        [
             "advertising agency",
             "creative agency",
             "media campaign",
@@ -570,26 +626,26 @@ def infer_category(title):
             "iec campaign",
             "communication agency",
             "pr agency",
-        ]
+        ],
     ):
         return "Advertising / Creative / Outreach"
 
-    if any(
-        item in text
-        for item in [
+    if contains_any_phrase(
+        text,
+        [
             "festival management",
             "mela management",
             "organising mela",
             "organizing mela",
             "cultural event",
             "cultural programme",
-        ]
+        ],
     ):
         return "Festival / Mela / Cultural"
 
-    if any(
-        item in text
-        for item in [
+    if contains_any_phrase(
+        text,
+        [
             "event management",
             "event agency",
             "event production",
@@ -604,7 +660,7 @@ def infer_category(title):
             "dealer meet",
             "launch event",
             "product launch",
-        ]
+        ],
     ):
         return "Event / Experiential"
 
@@ -851,9 +907,9 @@ SERVICE_ACTION_TERMS = [
 
 def is_relevant_event_title(title):
     """
-    Decide whether a title represents an actual event/exhibition/creative
-    service opportunity, not merely a procurement page or a procurement
-    process meeting.
+    Strict event/exhibition/creative relevance check.
+
+    Uses boundary-aware phrase matching so "stall" does not match "install".
     """
 
     title = normalize_space(
@@ -866,31 +922,38 @@ def is_relevant_event_title(title):
     if title in GENERIC_NAV_TITLES:
         return False
 
-    if any(
-        phrase in title
-        for phrase in FALSE_POSITIVE_PHRASES
+    if contains_any_phrase(
+        title,
+        FALSE_POSITIVE_PHRASES,
     ):
         return False
 
-    if any(
-        exclusion in title
-        for exclusion in NON_EVENT_EXCLUSIONS
+    if contains_any_phrase(
+        title,
+        NON_EVENT_EXCLUSIONS,
     ):
         return False
 
-    # Explicit high-confidence service phrases.
-    if any(
-        phrase in title
-        for phrase in EVENT_SERVICE_PHRASES
+    if contains_any_phrase(
+        title,
+        EVENT_SERVICE_PHRASES,
     ):
         return True
 
-    # Empanelment must explicitly concern our service area.
     if (
-        "empanel" in title
-        and any(
-            term in title
-            for term in [
+        contains_phrase(
+            title,
+            "empanelment",
+        )
+        or
+        contains_phrase(
+            title,
+            "empanel",
+        )
+    ):
+        if contains_any_phrase(
+            title,
+            [
                 "event",
                 "exhibition",
                 "advertising",
@@ -899,27 +962,25 @@ def is_relevant_event_title(title):
                 "publicity",
                 "communication",
                 "experiential",
-            ]
-        )
-    ):
-        return True
+            ],
+        ):
+            return True
 
-    # General service-action + event-object combination.
-    has_event_object = any(
-        term in title
-        for term in EVENT_OBJECT_TERMS
+    has_event_object = contains_any_phrase(
+        title,
+        EVENT_OBJECT_TERMS,
     )
 
-    has_service_action = any(
-        term in title
-        for term in SERVICE_ACTION_TERMS
+    has_service_action = contains_any_phrase(
+        title,
+        SERVICE_ACTION_TERMS,
     )
 
-    if has_event_object and has_service_action:
-        return True
-
-    return False
-
+    return (
+        has_event_object
+        and
+        has_service_action
+    )
 
 
 PROCUREMENT_STRONG_TERMS = [
@@ -1907,15 +1968,6 @@ class TenderCrawler:
                 "No usable GePNIC page returned."
             )
 
-        if (
-            "captcha" in first_html.lower()
-            and
-            len(first_html) < 100000
-        ):
-            raise RuntimeError(
-                "CAPTCHA_OR_LOGIN_REQUIRED"
-            )
-
         def parse_page(
             html,
             page_url,
@@ -2271,17 +2323,6 @@ class TenderCrawler:
 
         first_response.raise_for_status()
 
-        lower_page = first_response.text.lower()
-
-        if (
-            "captcha" in lower_page
-            and
-            len(first_response.text) < 50000
-        ):
-            raise RuntimeError(
-                "CAPTCHA_OR_LOGIN_REQUIRED"
-            )
-
         queue = [
             first_response.url
         ]
@@ -2473,31 +2514,40 @@ class TenderCrawler:
                         "html.parser",
                     )
 
-                    # Important: relevance comes from actual link/title,
-                    # not footer/menu text from the entire page.
-                    hits = keyword_hits(
-                        label
+                    # Resolve the real child-page title before deciding relevance.
+                    title = label
+
+                    heading = child.find(
+                        [
+                            "h1",
+                            "h2",
+                            "h3",
+                        ]
                     )
 
-                    if not hits:
-                        continue
+                    if heading:
+                        heading_title = normalize_space(
+                            heading.get_text(
+                                " ",
+                                strip=True,
+                            )
+                        )
 
-                    title = label
+                        if valid_tender_title(
+                            heading_title
+                        ):
+                            title = heading_title
 
                     if not valid_tender_title(
                         title
                     ):
-                        heading = child.find(
-                            [
-                                "h1",
-                                "h2",
-                                "h3",
-                            ]
+                        page_title = child.find(
+                            "title"
                         )
 
-                        if heading:
+                        if page_title:
                             title = normalize_space(
-                                heading.get_text(
+                                page_title.get_text(
                                     " ",
                                     strip=True,
                                 )
@@ -2506,6 +2556,13 @@ class TenderCrawler:
                     if not valid_tender_title(
                         title
                     ):
+                        continue
+
+                    hits = keyword_hits(
+                        title
+                    )
+
+                    if not hits:
                         continue
 
                     documents = []
@@ -5202,6 +5259,23 @@ def sanitize_active_row(row):
             )
         ] = ""
 
+
+    evidence_quotes_value = normalize_space(
+        mapping[
+            "Evidence Quotes"
+        ]
+    )
+
+    if re.fullmatch(
+        r"\d+(?:\.0+)?",
+        evidence_quotes_value,
+    ):
+        clean[
+            ACTIVE_HEADERS.index(
+                "Evidence Quotes"
+            )
+        ] = ""
+
     extraction_status = normalize_space(
         mapping[
             "Extraction Status"
@@ -5361,7 +5435,10 @@ def sync_portal_directory(
             else ""
         )
 
-        if message.isdigit():
+        if re.fullmatch(
+            r"\d+(?:\.0+)?",
+            message,
+        ):
             message = ""
 
         try:
@@ -5375,6 +5452,18 @@ def sync_portal_directory(
             )
         except Exception:
             discovered_count = 0
+
+        if (
+            crawler_status == "SUCCESS"
+            and
+            discovered_count == 0
+            and
+            re.fullmatch(
+                r"\d+(?:\.0+)?",
+                message or "",
+            )
+        ):
+            message = ""
 
         rows.append([
             portal.portal,
