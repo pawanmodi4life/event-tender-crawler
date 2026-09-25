@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-SERVICE-FILTER-V6"
+CODE_VERSION = "2026-09-25-DATE-GEM-FIX-V7"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -470,6 +470,7 @@ class EligibilityEvidence(BaseModel):
     named_celebrity_or_artist_mandate: bool | None = None
 
     submission_deadline: str | None = None
+    bid_opening_date: str | None = None
     pre_bid_date: str | None = None
 
     non_core_scope: bool | None = None
@@ -1672,6 +1673,82 @@ def _extract_labeled_value(text_value, labels, max_chars=120):
     return ""
 
 
+
+def _clean_date_value(value):
+    """
+    Keep date/time text concise and stop before the next likely field label.
+    """
+    value = normalize_space(
+        value or ""
+    )
+
+    if not value:
+        return ""
+
+    # Stop when another common tender field begins on the same flattened line.
+    stop_patterns = [
+        r"\s+(?:bid\s+opening\s+date|bid\s+end\s+date|bid\s+start\s+date|"
+        r"submission\s+deadline|closing\s+date|pre[\s-]*bid|emd|earnest\s+money|"
+        r"estimated\s+value|tender\s+value|turnover|organisation\s+name|"
+        r"organization\s+name|department\s+name)\b",
+    ]
+
+    for pattern in stop_patterns:
+        match = re.search(
+            pattern,
+            value,
+            flags=re.I,
+        )
+        if match:
+            value = value[:match.start()]
+
+    return normalize_space(
+        value
+    )[:100]
+
+
+def _extract_date_field(text_value, label_patterns):
+    """
+    Extract a tender date/time by label from flattened PDF/HTML text.
+    Supports GeM wording such as:
+      Bid End Date/Time
+      Bid Opening Date/Time
+    and common government tender wording.
+    """
+    if not text_value:
+        return ""
+
+    # Strong labelled extraction first.
+    for label in label_patterns:
+        pattern = (
+            rf"(?:{label})\s*"
+            rf"(?:[:\-–]\s*)?"
+            rf"(.{{1,120}})"
+        )
+
+        match = re.search(
+            pattern,
+            text_value,
+            flags=re.I,
+        )
+
+        if match:
+            candidate = _clean_date_value(
+                match.group(1)
+            )
+
+            if re.search(
+                r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
+                r"\d{4}[./-]\d{1,2}[./-]\d{1,2}|"
+                r"\d{1,2}(?:st|nd|rd|th)?\s+"
+                r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})\b",
+                candidate,
+                flags=re.I,
+            ):
+                return candidate
+
+    return ""
+
 def extract_deterministic_metadata(
     candidate,
     documents,
@@ -1723,18 +1800,21 @@ def extract_deterministic_metadata(
         )
     )
 
-    deadline = _extract_labeled_value(
+    deadline = _extract_date_field(
         combined,
         [
             r"bid\s*end\s*date(?:\s*/\s*time)?",
             r"bid\s*submission\s*end\s*date(?:\s*/\s*time)?",
+            r"final\s*submission\s*date(?:\s*/\s*time)?",
             r"last\s*date(?:\s*and\s*time)?\s*of\s*submission",
             r"last\s*date\s*for\s*submission",
+            r"last\s*date\s*of\s*submission",
             r"submission\s*deadline",
+            r"bid\s*submission\s*deadline",
             r"closing\s*date(?:\s*/\s*time)?",
             r"tender\s*closing\s*date",
+            r"date\s*of\s*closing",
         ],
-        max_chars=80,
     ) or (
         candidate.deadline_raw
         if (
@@ -1744,13 +1824,24 @@ def extract_deterministic_metadata(
         else ""
     )
 
-    pre_bid = _extract_labeled_value(
+    bid_opening = _extract_date_field(
+        combined,
+        [
+            r"bid\s*opening\s*date(?:\s*/\s*time)?",
+            r"date\s*of\s*opening\s*of\s*bids?",
+            r"date\s*and\s*time\s*of\s*opening",
+            r"tender\s*opening\s*date(?:\s*/\s*time)?",
+            r"technical\s*bid\s*opening\s*date(?:\s*/\s*time)?",
+            r"opening\s*date(?:\s*/\s*time)?",
+        ],
+    )
+
+    pre_bid = _extract_date_field(
         combined,
         [
             r"pre[\s-]*bid\s*(?:meeting|conference)?\s*(?:date)?",
             r"pre[\s-]*bid\s*date",
         ],
-        max_chars=80,
     )
 
     emd_text = _extract_labeled_value(
@@ -1816,6 +1907,7 @@ def extract_deterministic_metadata(
         "tender_reference": tender_reference,
         "organisation": organisation or None,
         "submission_deadline": deadline or None,
+        "bid_opening_date": bid_opening or None,
         "pre_bid_date": pre_bid or None,
         "emd_inr": _safe_number_from_text(
             emd_text
@@ -1851,6 +1943,7 @@ def merge_deterministic_metadata(
         "tender_reference",
         "organisation",
         "submission_deadline",
+        "bid_opening_date",
         "pre_bid_date",
         "emd_inr",
         "estimated_value_inr",
@@ -4137,7 +4230,7 @@ def crawl_gem():
             CrawlHealth(
                 "Government e-Marketplace (GeM)",
                 GEM_GTE_URL,
-                "NO_RESULTS",
+                "GEM_STANDARD_UNREACHABLE",
                 0,
                 (
                     "Primary GeM unavailable/empty and "
@@ -5441,6 +5534,7 @@ ACTIVE_HEADERS = [
     "EMD (INR)",
     "EMD/MSME Exemption Evidence",
     "Submission Deadline",
+    "Tender Opening Date",
     "Min Turnover Req",
     "Past Experience Requirement",
     "Entity Restriction",
@@ -5544,8 +5638,8 @@ def existing_tender_keys(
 
 def clean_active_tenders_sheet(sheet):
     """
-    Remove stale false positives and malformed rows from older crawler logic.
-    Keeps only rows that still look like a specific event-related procurement.
+    Remove stale false positives and migrate older tracker rows to the
+    current ACTIVE_HEADERS schema.
     """
 
     if not CLEAN_EXISTING_ACTIVE_TENDERS:
@@ -5554,109 +5648,83 @@ def clean_active_tenders_sheet(sheet):
     values = sheet.get_all_values()
 
     if len(values) <= 1:
+        # Ensure the latest schema exists even on an empty sheet.
+        sheet.clear()
+        sheet.update(
+            values=[ACTIVE_HEADERS],
+            range_name=f"A1:AA1",
+        )
         return 0
 
-    headers = values[0]
+    old_headers = values[0]
 
-    def idx(name):
+    def old_value(row, name):
         try:
-            return headers.index(
+            index = old_headers.index(
                 name
             )
         except ValueError:
-            return None
+            return ""
 
-    title_index = idx(
-        "Tender Title & Scope"
-    )
-    tender_id_index = idx(
-        "Tender ID / Ref No"
-    )
-    portal_index = idx(
-        "Portal Name"
-    )
-    state_index = idx(
-        "State"
-    )
-    org_index = idx(
-        "Organization / Dept"
-    )
-    detail_index = idx(
-        "Portal / Detail Link"
-    )
-    docs_index = idx(
-        "RFP / Tender Doc URLs"
-    )
-
-    if title_index is None:
-        log.warning(
-            "Cannot clean Active_Tenders: title column not found."
+        return (
+            row[index]
+            if index < len(row)
+            else ""
         )
-        return 0
 
     kept_rows = []
     removed = 0
 
     for row in values[1:]:
-        padded = list(row) + [
-            ""
-        ] * max(
-            0,
-            len(headers) - len(row),
+        title = old_value(
+            row,
+            "Tender Title & Scope",
         )
-
-        padded = padded[:len(headers)]
-
-        title = padded[
-            title_index
-        ]
 
         if not normalize_space(
             title
         ):
             continue
 
-        detail_url = (
-            padded[detail_index]
-            if detail_index is not None
-            else ""
+        detail_url = old_value(
+            row,
+            "Portal / Detail Link",
+        )
+
+        docs_text = old_value(
+            row,
+            "RFP / Tender Doc URLs",
         )
 
         candidate = TenderCandidate(
-            portal=(
-                padded[portal_index]
-                if portal_index is not None
-                else ""
+            portal=old_value(
+                row,
+                "Portal Name",
             ),
-            state=(
-                padded[state_index]
-                if state_index is not None
-                else "Pan India"
-            ),
+            state=old_value(
+                row,
+                "State",
+            ) or "Pan India",
             source_url=detail_url,
-            tender_id=(
-                padded[tender_id_index]
-                if tender_id_index is not None
-                else ""
+            tender_id=old_value(
+                row,
+                "Tender ID / Ref No",
             ),
-            organization=(
-                padded[org_index]
-                if org_index is not None
-                else ""
+            organization=old_value(
+                row,
+                "Organization / Dept",
             ),
             title=title,
-            detail_url=detail_url,
-            discovered_doc_urls=(
-                [
-                    item
-                    for item in (
-                        padded[docs_index].splitlines()
-                        if docs_index is not None
-                        else []
-                    )
-                    if item
-                ]
+            deadline_raw=old_value(
+                row,
+                "Submission Deadline",
             ),
+            detail_url=detail_url,
+            discovered_doc_urls=[
+                item
+                for item in docs_text.splitlines()
+                if item
+            ],
         )
 
         service_ok, _service_reason = is_event_service_candidate(
@@ -5675,39 +5743,34 @@ def clean_active_tenders_sheet(sheet):
             )
         )
 
-        # Remove obviously corrupted historic rows such as "35" in URL/status cells.
         if keep:
-            invalid_scalar = False
-
             for field_name in [
                 "RFP / Tender Doc URLs",
                 "Portal / Detail Link",
                 "AI Model Used",
                 "Extraction Status",
             ]:
-                field_index = idx(
-                    field_name
-                )
-
-                if field_index is None:
-                    continue
-
                 value = normalize_space(
-                    padded[
-                        field_index
-                    ]
+                    old_value(
+                        row,
+                        field_name,
+                    )
                 )
 
                 if value.isdigit():
-                    invalid_scalar = True
+                    keep = False
                     break
 
-            if invalid_scalar:
-                keep = False
-
         if keep:
+            migrated = [
+                old_value(
+                    row,
+                    header,
+                )
+                for header in ACTIVE_HEADERS
+            ]
             kept_rows.append(
-                padded
+                migrated
             )
         else:
             removed += 1
@@ -5720,14 +5783,15 @@ def clean_active_tenders_sheet(sheet):
     sheet.clear()
 
     output = [
-        headers
+        ACTIVE_HEADERS
     ] + kept_rows
 
     sheet.update(
         values=output,
         range_name=(
-            f"A1:Z{len(output)}"
+            f"A1:AA{len(output)}"
         ),
+        value_input_option="RAW",
     )
 
     log.info(
@@ -5925,7 +5989,7 @@ def write_active_rows_exact(
     sheet.update(
         values=validated,
         range_name=(
-            f"A{start_row}:Z{end_row}"
+            f"A{start_row}:AA{end_row}"
         ),
         value_input_option="RAW",
     )
@@ -6286,6 +6350,7 @@ def validate_deployed_build():
         "crawl_gem",
         "is_event_service_candidate",
         "is_expired_candidate",
+        "_extract_date_field",
     ]
 
     missing = [
@@ -6413,6 +6478,34 @@ def run_pipeline():
         "Government e-Marketplace (GeM)"
     ] = gem_health
 
+    mirrored_gem_ids = sorted({
+        normalize_space(
+            candidate.tender_id or ""
+        ).upper()
+        for candidate in all_candidates
+        if re.fullmatch(
+            r"GEM/\d{4}/B/\d+",
+            normalize_space(
+                candidate.tender_id or ""
+            ).upper(),
+        )
+    })
+
+    if (
+        gem_health.discovered_count == 0
+        and
+        mirrored_gem_ids
+    ):
+        gem_health.message = (
+            normalize_space(
+                gem_health.message
+            )
+            + " "
+            + f"{len(mirrored_gem_ids)} GeM bid reference(s) were nevertheless "
+              "discovered from buyer/organisation tender pages and will be processed "
+              "through those source documents."
+        ).strip()
+
     unique_map = {}
 
     for candidate in all_candidates:
@@ -6473,7 +6566,7 @@ def run_pipeline():
         values=[
             ACTIVE_HEADERS
         ],
-        range_name="A1:Z1",
+        range_name="A1:AA1",
     )
 
     clean_active_tenders_sheet(
@@ -6724,6 +6817,12 @@ def run_pipeline():
             candidate.deadline_raw
             or
             "NOT VERIFIED",
+
+            evidence.get(
+                "bid_opening_date"
+            )
+            or
+            "NOT VERIFIED / NOT STATED",
 
             (
                 evidence.get(
