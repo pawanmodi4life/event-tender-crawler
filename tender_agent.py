@@ -62,7 +62,7 @@ OPENAI_API_KEY = os.getenv(
 # Current cost-sensitive OpenAI API model.
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-6-luna",
+    "gpt-5.6-luna",
 )
 
 GEM_LISTING_URL = os.getenv(
@@ -122,6 +122,15 @@ MAX_DOCUMENTS_PER_TENDER = int(
         "MAX_DOCUMENTS_PER_TENDER",
         "20",
     )
+)
+
+
+CLEAN_EXISTING_ACTIVE_TENDERS = (
+    os.getenv(
+        "CLEAN_EXISTING_ACTIVE_TENDERS",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "y"}
 )
 
 
@@ -462,18 +471,19 @@ def keyword_hits(text):
 
 
 def infer_category(title):
-    text = (
+    text = normalize_space(
         title or ""
     ).lower()
 
     if any(
         item in text
         for item in [
-            "exhibition",
             "exhibition stall",
+            "exhibition pavilion",
             "stall design",
             "stall fabrication",
-            "pavilion",
+            "pavilion design",
+            "pavilion fabrication",
             "expo",
             "trade fair",
         ]
@@ -484,10 +494,12 @@ def infer_category(title):
         item in text
         for item in [
             "event",
+            "exhibition",
             "advertising",
             "creative",
             "publicity",
             "media",
+            "communication",
         ]
     ):
         return "Empanelment"
@@ -495,11 +507,16 @@ def infer_category(title):
     if any(
         item in text
         for item in [
-            "conference",
-            "summit",
-            "conclave",
-            "seminar",
-            "convention",
+            "conference management",
+            "organising conference",
+            "organizing conference",
+            "conduct of conference",
+            "summit management",
+            "organising summit",
+            "organizing summit",
+            "conclave management",
+            "organising conclave",
+            "organizing conclave",
         ]
     ):
         return "Conference / Conclave"
@@ -522,8 +539,10 @@ def infer_category(title):
     if any(
         item in text
         for item in [
-            "festival",
-            "mela",
+            "festival management",
+            "mela management",
+            "organising mela",
+            "organizing mela",
             "cultural event",
             "cultural programme",
         ]
@@ -536,6 +555,7 @@ def infer_category(title):
             "event management",
             "event agency",
             "event production",
+            "event execution",
             "corporate event",
             "annual day",
             "foundation day",
@@ -545,6 +565,7 @@ def infer_category(title):
             "roadshow",
             "dealer meet",
             "launch event",
+            "product launch",
         ]
     ):
         return "Event / Experiential"
@@ -608,109 +629,230 @@ def valid_tender_title(title):
     return True
 
 
-def is_relevant_event_tender(candidate):
-    """
-    Strict title-based event relevance filter.
+FALSE_POSITIVE_PHRASES = [
+    "pre-tender conference",
+    "pre tender conference",
+    "pre-bid conference",
+    "pre bid conference",
+    "pre-bid meeting",
+    "pre bid meeting",
+    "pre nit conference",
+    "pre-nit conference",
+    "public procurement seminar",
+    "procurement seminar",
+    "tender conference",
+    "tender creation",
+    "tender terms",
+    "procurement plan",
+    "government initiatives",
+    "news updates",
+    "latest news",
+    "search eoi / pre nit conference",
+    "search eoi/pre nit conference",
+]
 
-    Relevance is decided from the actual tender/link title only.
-    The inferred category is NOT used for acceptance because generic
-    categories can otherwise create false positives.
+GENERIC_NAV_TITLES = {
+    "dae secretariat matters",
+    "dae unit tenders",
+    "dae procurement plan",
+    "list of internal dae tenders",
+    "public sector units",
+    "government initiatives",
+    "news updates",
+    "downloads",
+    "e-tender",
+    "e tender",
+    "tender creation",
+    "tender terms",
+    "procurement plan",
+    "latest tenders",
+    "active tenders",
+    "tenders",
+    "tender document",
+    "tender notices",
+    "notice",
+    "notices",
+    "tender portal",
+    "procurement",
+    "tender",
+}
+
+EVENT_SERVICE_PHRASES = [
+    "event management",
+    "event management agency",
+    "event agency",
+    "event organiser",
+    "event organizer",
+    "event production",
+    "event execution",
+    "event logistics",
+    "event coordination",
+    "event planning",
+    "event services",
+    "event partner",
+
+    "exhibition stall",
+    "exhibition pavilion",
+    "stall design",
+    "stall fabrication",
+    "stall construction",
+    "pavilion design",
+    "pavilion fabrication",
+    "pavilion construction",
+    "exhibition design",
+    "exhibition management",
+    "expo management",
+    "trade fair management",
+
+    "conference management",
+    "organising conference",
+    "organizing conference",
+    "organisation of conference",
+    "organization of conference",
+    "conduct of conference",
+
+    "summit management",
+    "organising summit",
+    "organizing summit",
+    "organisation of summit",
+    "organization of summit",
+
+    "conclave management",
+    "organising conclave",
+    "organizing conclave",
+    "organisation of conclave",
+    "organization of conclave",
+
+    "seminar management",
+    "organising seminar",
+    "organizing seminar",
+
+    "mela management",
+    "organising mela",
+    "organizing mela",
+    "festival management",
+    "organising festival",
+    "organizing festival",
+    "cultural event",
+    "cultural programme",
+
+    "brand activation",
+    "experiential marketing",
+    "roadshow",
+    "dealer meet",
+    "annual day",
+    "foundation day",
+    "award ceremony",
+    "launch event",
+    "product launch",
+    "inauguration event",
+
+    "publicity campaign",
+    "outreach campaign",
+    "iec campaign",
+    "media campaign",
+    "advertising agency",
+    "creative agency",
+    "communication agency",
+    "pr agency",
+
+    "audio visual",
+    "av production",
+    "stage setup",
+    "stage production",
+    "sound and light",
+    "tentage",
+    "event decoration",
+]
+
+EVENT_OBJECT_TERMS = [
+    "event",
+    "exhibition",
+    "expo",
+    "trade fair",
+    "conference",
+    "conclave",
+    "summit",
+    "seminar",
+    "mela",
+    "festival",
+    "roadshow",
+    "annual day",
+    "foundation day",
+    "award ceremony",
+    "launch",
+    "pavilion",
+    "stall",
+]
+
+SERVICE_ACTION_TERMS = [
+    "organise",
+    "organize",
+    "organising",
+    "organizing",
+    "organisation",
+    "organization",
+    "conduct",
+    "manage",
+    "management",
+    "execute",
+    "execution",
+    "design",
+    "fabricate",
+    "fabrication",
+    "setup",
+    "set up",
+    "production",
+    "agency",
+    "empanelment",
+    "empanel",
+    "selection of agency",
+    "appointment of agency",
+]
+
+
+def is_relevant_event_title(title):
+    """
+    Decide whether a title represents an actual event/exhibition/creative
+    service opportunity, not merely a procurement page or a procurement
+    process meeting.
     """
 
     title = normalize_space(
-        candidate.title or ""
+        title or ""
     ).lower()
 
     if not title:
         return False
 
-    generic_titles = {
-        "dae secretariat matters",
-        "dae unit tenders",
-        "dae procurement plan",
-        "list of internal dae tenders",
-        "public sector units",
-        "government initiatives",
-        "news updates",
-        "downloads",
-        "e-tender",
-        "tender creation",
-        "tender terms",
-        "procurement plan",
-        "latest tenders",
-        "active tenders",
-        "tenders",
-        "tender document",
-        "tender notices",
-        "notice",
-        "notices",
-    }
-
-    if title in generic_titles:
+    if title in GENERIC_NAV_TITLES:
         return False
-
-    for exclusion in NON_EVENT_EXCLUSIONS:
-        if exclusion in title:
-            return False
-
-    strong_phrases = [
-        "event management",
-        "event agency",
-        "event management agency",
-        "event production",
-        "event logistics",
-        "exhibition",
-        "exhibition stall",
-        "exhibition pavilion",
-        "stall design",
-        "stall fabrication",
-        "expo",
-        "trade fair",
-        "conference",
-        "seminar",
-        "convention",
-        "summit",
-        "conclave",
-        "roadshow",
-        "dealer meet",
-        "annual day",
-        "foundation day",
-        "award ceremony",
-        "cultural programme",
-        "cultural event",
-        "brand activation",
-        "experiential marketing",
-        "publicity campaign",
-        "outreach campaign",
-        "iec campaign",
-        "advertising agency",
-        "creative agency",
-        "communication agency",
-        "pr agency",
-        "audio visual",
-        "av production",
-        "sound and light",
-        "stage setup",
-        "stage production",
-        "tentage",
-        "festival",
-        "mela",
-        "launch event",
-        "product launch",
-        "tourism event",
-        "sports event",
-    ]
 
     if any(
         phrase in title
-        for phrase in strong_phrases
+        for phrase in FALSE_POSITIVE_PHRASES
+    ):
+        return False
+
+    if any(
+        exclusion in title
+        for exclusion in NON_EVENT_EXCLUSIONS
+    ):
+        return False
+
+    # Explicit high-confidence service phrases.
+    if any(
+        phrase in title
+        for phrase in EVENT_SERVICE_PHRASES
     ):
         return True
 
-    if "empanel" in title:
-        if any(
-            phrase in title
-            for phrase in [
+    # Empanelment must explicitly concern our service area.
+    if (
+        "empanel" in title
+        and any(
+            term in title
+            for term in [
                 "event",
                 "exhibition",
                 "advertising",
@@ -718,11 +860,35 @@ def is_relevant_event_tender(candidate):
                 "media",
                 "publicity",
                 "communication",
+                "experiential",
             ]
-        ):
-            return True
+        )
+    ):
+        return True
+
+    # General service-action + event-object combination.
+    has_event_object = any(
+        term in title
+        for term in EVENT_OBJECT_TERMS
+    )
+
+    has_service_action = any(
+        term in title
+        for term in SERVICE_ACTION_TERMS
+    )
+
+    if has_event_object and has_service_action:
+        return True
 
     return False
+
+
+def is_relevant_event_tender(candidate):
+    # Relevance must be based on the actual tender title.
+    # Do NOT use inferred category or full webpage text here.
+    return is_relevant_event_title(
+        candidate.title
+    )
 
 
 def extract_ref_candidates(text):
@@ -1873,8 +2039,20 @@ def crawl_gem():
             CrawlHealth(
                 "Government e-Marketplace (GeM)",
                 GEM_LISTING_URL,
-                "SUCCESS",
+                (
+                    "SUCCESS"
+                    if output
+                    else "NO_RESULTS"
+                ),
                 len(output),
+                (
+                    ""
+                    if output
+                    else (
+                        "GeM page/search UI loaded, but no matching "
+                        "event/exhibition GTE bids were discovered."
+                    )
+                ),
             ),
         )
 
@@ -3106,6 +3284,94 @@ def existing_tender_keys(
     }
 
 
+def clean_active_tenders_sheet(sheet):
+    """
+    Remove stale false-positive rows created by older crawler logic.
+
+    This does NOT delete valid event tenders merely because AI extraction
+    failed. It only removes rows whose tender title fails the same strict
+    relevance test used for new candidates.
+    """
+
+    if not CLEAN_EXISTING_ACTIVE_TENDERS:
+        return 0
+
+    values = sheet.get_all_values()
+
+    if len(values) <= 1:
+        return 0
+
+    headers = values[0]
+
+    try:
+        title_index = headers.index(
+            "Tender Title & Scope"
+        )
+    except ValueError:
+        log.warning(
+            "Cannot clean Active_Tenders: title column not found."
+        )
+        return 0
+
+    kept_rows = []
+    removed = 0
+
+    for row in values[1:]:
+        padded = list(row) + [
+            ""
+        ] * max(
+            0,
+            len(headers) - len(row),
+        )
+
+        padded = padded[:len(headers)]
+
+        title = padded[
+            title_index
+        ]
+
+        if not normalize_space(
+            title
+        ):
+            continue
+
+        if is_relevant_event_title(
+            title
+        ):
+            kept_rows.append(
+                padded
+            )
+        else:
+            removed += 1
+            log.info(
+                "Removing stale false-positive tracker row: %s",
+                title[:160],
+            )
+
+    if removed:
+        sheet.clear()
+
+        output = [
+            headers
+        ] + kept_rows
+
+        sheet.update(
+            values=output,
+            range_name=(
+                f"A1:Z{len(output)}"
+            ),
+        )
+
+        log.info(
+            "Cleaned Active_Tenders: removed %d false-positive rows, "
+            "kept %d rows.",
+            removed,
+            len(kept_rows),
+        )
+
+    return removed
+
+
 def sync_portal_directory(
     sheet,
     portals,
@@ -3410,6 +3676,10 @@ def run_pipeline():
             ACTIVE_HEADERS
         ],
         range_name="A1:Z1",
+    )
+
+    clean_active_tenders_sheet(
+        active_sheet
     )
 
     existing_keys = existing_tender_keys(
