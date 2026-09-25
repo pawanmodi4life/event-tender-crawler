@@ -68,7 +68,7 @@ OPENAI_API_KEY = os.getenv(
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-6-astra"
+    "gpt-5.6-luna"
 )
 
 GEM_LISTING_URL = os.getenv(
