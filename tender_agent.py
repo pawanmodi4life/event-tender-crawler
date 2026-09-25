@@ -4,13 +4,18 @@ import json
 import time
 import datetime
 import urllib.parse
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from google import genai
 from google.oauth2 import service_account
 import gspread
 from playwright.sync_api import sync_playwright
+
+# Disable SSL warnings for government portals with self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     import pandas as pd
@@ -59,24 +64,29 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 EXCEL_MASTER_FILE = "Pan_India_Tender_URL_Master.xlsx"
 
 # ==============================================================================
-# 2. MASTER 109 SOURCES DIRECTORY LOADER & SYNC
+# 2. MASTER 109 SOURCES DIRECTORY LOADER & BATCH SYNC
 # ==============================================================================
-def load_all_master_portals(gc):
-    """Loads all 109 active URLs and populates the Portal_Directory worksheet."""
-    print("Loading all 109 Pan-India procurement portals...")
+def load_and_sync_portal_directory(gc):
+    """Loads all 109 active URLs and populates the Portal_Directory worksheet using a single batch call."""
+    print("Loading all Pan-India procurement portals from registry...")
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
     try:
         portal_sheet = spreadsheet.worksheet("Portal_Directory")
     except gspread.WorksheetNotFound:
-        portal_sheet = spreadsheet.add_worksheet(title="Portal_Directory", rows="150", cols="12")
+        # Pass integers for rows and cols to prevent API error 400
+        portal_sheet = spreadsheet.add_worksheet(title="Portal_Directory", rows=250, cols=15)
+        print("Created worksheet tab: 'Portal_Directory'")
 
     headers = [
         "Portal", "Category", "State", "URL", "Active",
         "Last Crawl", "Tender Count", "Documents Accessible",
         "Login/Captcha Required", "Crawl Priority"
     ]
-    portal_sheet.update(values=[headers], range_name="A1:J1")
+    try:
+        portal_sheet.update(range_name="A1:J1", values=[headers])
+    except Exception:
+        portal_sheet.update([headers], "A1:J1")
 
     portals_list = []
     if pd and os.path.exists(EXCEL_MASTER_FILE):
@@ -115,7 +125,35 @@ def load_all_master_portals(gc):
         except Exception as e:
             print(f"Excel read notice: {e}")
 
-    # Initial bulk write if sheet is empty
+    # Fallback list if Excel file is not uploaded
+    if not portals_list:
+        built_in_sources = [
+            ("Government e-Marketplace (GeM)", "National/Central", "Pan India", "https://gem.gov.in", "P1", "Yes (Direct RFP PDF & Corrigendum)", "No (Public BidPlus)"),
+            ("GeM BidPlus", "National/Central", "Pan India", "https://bidplus.gem.gov.in/all-bids", "P1", "Yes (Direct RFP PDF & Corrigendum)", "No (Public BidPlus)"),
+            ("Central Public Procurement Portal (CPPP)", "National/Central", "Pan India", "https://eprocure.gov.in/eprocure/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Government e-Tenders Portal", "National/Central", "Pan India", "https://www.etenders.gov.in/eprocure/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("MahaTenders", "State/UT", "Maharashtra", "https://mahatenders.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("UP e-Tenders", "State/UT", "Uttar Pradesh", "https://etender.up.nic.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Delhi Government Procurement", "State/UT", "Delhi", "https://govtprocurement.delhi.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Rajasthan eProcurement", "State/UT", "Rajasthan", "https://eproc.rajasthan.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Odisha e-Tenders", "State/UT", "Odisha", "https://tendersodisha.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("MP e-Tenders", "State/UT", "Madhya Pradesh", "https://mptenders.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("nProcure Gujarat", "State/UT", "Gujarat", "https://www.nprocure.com", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Karnataka Public Procurement Portal", "State/UT", "Karnataka", "https://eproc.karnataka.gov.in", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("West Bengal e-Tenders", "State/UT", "West Bengal", "https://wbtenders.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Tamil Nadu e-Tenders", "State/UT", "Tamil Nadu", "https://tntenders.gov.in/nicgep/app", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Bihar eProcurement", "State/UT", "Bihar", "https://eproc2.bihar.gov.in", "P1", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("Coal India Tenders", "PSU", "Pan India", "https://coalindiatenders.nic.in/nicgep/app", "P2", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("IOCL Tenders", "PSU", "Pan India", "https://iocletenders.nic.in/nicgep/app", "P2", "Yes (Public NIT, RFP & Pre-bid)", "No (Public Access)"),
+            ("BidAssist", "Third Party Aggregator", "Pan India", "https://bidassist.com", "P3", "Yes (Public Aggregator Link)", "No (Public Index)")
+        ]
+        for p, c, s, u, pr, da, lr in built_in_sources:
+            portals_list.append({
+                "portal": p, "category": c, "state": s, "url": u, "active": "Yes",
+                "doc_acc": da, "login_req": lr, "priority": pr
+            })
+
+    # One single batch write if tab is empty
     existing_rows = portal_sheet.get_all_values()
     if len(existing_rows) <= 1 and portals_list:
         rows_to_write = []
@@ -124,8 +162,11 @@ def load_all_master_portals(gc):
                 p["portal"], p["category"], p["state"], p["url"], p["active"],
                 "-", 0, p["doc_acc"], p["login_req"], p["priority"]
             ])
-        portal_sheet.update(values=rows_to_write, range_name=f"A2:J{len(rows_to_write)+1}")
-        print(f"Wrote all {len(rows_to_write)} portals to 'Portal_Directory' tab.")
+        try:
+            portal_sheet.update(range_name=f"A2:J{len(rows_to_write)+1}", values=rows_to_write)
+        except Exception:
+            portal_sheet.update(rows_to_write, f"A2:J{len(rows_to_write)+1}")
+        print(f"Populated all {len(rows_to_write)} portals in 'Portal_Directory' tab.")
 
     return portals_list, portal_sheet
 
@@ -211,7 +252,7 @@ def crawl_gepnic_endpoint(portal_meta):
     }
 
     try:
-        resp = requests.get(feed_url, headers=headers, timeout=12)
+        resp = requests.get(feed_url, headers=headers, timeout=12, verify=False)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             rows = soup.find_all("tr")
@@ -227,13 +268,11 @@ def crawl_gepnic_endpoint(portal_meta):
                         tender_id_match = re.search(r"\d{4}_[A-Z0-9]+_\d+_\d+", title_col)
                         tender_id = tender_id_match.group(0) if tender_id_match else f"{portal_name[:3]}/{int(time.time())}"
 
-                        # Direct portal view link
                         portal_link = f"{base_url}?page=FrontEndTenderDetailsExternal&service=page&tenderId={tender_id}"
                         rfp_doc_url = f"{base_url}?page=FrontEndDownloadTenderDocument&service=page&tenderId={tender_id}"
                         pre_bid_info = f"View Pre-bid schedule at: {portal_link}"
                         corrigendum_url = f"{base_url}?page=FrontEndCorrigendumDetailsExternal&service=page&tenderId={tender_id}"
 
-                        # Extract exact anchor if present
                         link_elem = cols[4].find("a", href=True) or row.find("a", href=True)
                         if link_elem and link_elem["href"]:
                             raw_href = link_elem["href"]
@@ -287,7 +326,6 @@ def crawl_gem_live(page):
                             bid_no = bid_match.group(0)
                             bid_num = bid_no.split('/')[-1]
 
-                            # Construct direct GeM URLs
                             rfp_doc_url = f"https://bidplus.gem.gov.in/showbidDocument/{bid_num}"
                             corrigendum_url = f"https://bidplus.gem.gov.in/show-bid-corrigendum/{bid_num}"
                             portal_link = f"https://bidplus.gem.gov.in/all-bids?bid={bid_num}"
@@ -376,13 +414,13 @@ def purge_legacy_dummy_rows(sheet):
             dummy_indicators = [
                 "gem/2026/b/7891024", "cppp/2026/dpiit", "up/2026/tourism/4512",
                 "rj/2026/sppp", "mh/2026/cidco/3321", "gem bid document pdf attached",
-                "cppp tender notice & rfp pdf"
+                "cppp tender notice & rfp pdf", "ai parsing exception"
             ]
             for idx in range(len(rows), 1, -1):
                 row_str = " ".join([str(c).lower() for c in rows[idx-1]])
                 if any(di in row_str for di in dummy_indicators):
                     sheet.delete_rows(idx)
-                    print(f"Purged legacy dummy row at index {idx}")
+                    print(f"Purged legacy dummy row at row #{idx}")
     except Exception as e:
         print(f"Notice during dummy row cleanup: {e}")
 
@@ -400,7 +438,13 @@ def run_pipeline():
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     active_sheet = spreadsheet.worksheet("Active_Tenders")
 
-    # 1. Ensure Updated Column Headers in Active_Tenders Tab
+    # 1. Expand columns if sheet has fewer than 18 columns (Prevents API Error 400)
+    current_cols = active_sheet.col_count
+    if current_cols < 18:
+        print(f"Expanding Active_Tenders columns from {current_cols} to 20...")
+        active_sheet.add_cols(20 - current_cols)
+
+    # 2. Update Column Headers in Active_Tenders Tab
     updated_headers = [
         "Date Found", "Tender ID / Ref No", "Portal Name", "Organization / Dept",
         "Tender Title & Scope", "Category", "Estimated Value (INR)", "EMD & Exemption",
@@ -408,15 +452,18 @@ def run_pipeline():
         "RFP / Tender Doc URL", "Pre-Bid Info / Clarification", "Corrigenda Links", "Portal Link",
         "Qualification Status", "Remarks & Action Plan"
     ]
-    active_sheet.update(values=[updated_headers], range_name="A1:R1")
+    try:
+        active_sheet.update(range_name="A1:R1", values=[updated_headers])
+    except Exception:
+        active_sheet.update([updated_headers], "A1:R1")
 
-    # 2. Load and Sync All 109 Master Portals into Portal_Directory Tab
-    all_109_portals, portal_sheet = load_all_master_portals(gc)
+    # 3. Load and Sync All 109 Master Portals into Portal_Directory Tab
+    all_109_portals, portal_sheet = load_and_sync_portal_directory(gc)
 
-    # 3. Clean Legacy Dummy Rows from Active_Tenders
+    # 4. Clean Legacy Dummy Rows from Active_Tenders
     purge_legacy_dummy_rows(active_sheet)
 
-    # 4. Read Existing Tender IDs (Avoid Duplicates)
+    # 5. Read Existing Tender IDs (Avoid Duplicates)
     try:
         col_b_vals = active_sheet.col_values(2)
         existing_ids = set(col_b_vals[1:])
@@ -427,9 +474,9 @@ def run_pipeline():
     live_tenders = []
     portal_counts = {}
 
-    # 5. Multi-threaded Parallel Crawl Across ALL 109 Portals (No hardcoded limit)
+    # 6. Multi-threaded Parallel Crawl Across ALL 109 Portals
     print(f"Executing parallel crawl across ALL {len(all_109_portals)} master portals...")
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(crawl_gepnic_endpoint, portal): portal for portal in all_109_portals}
         for f in as_completed(futures):
             p_meta = futures[f]
@@ -442,7 +489,7 @@ def run_pipeline():
             except Exception:
                 portal_counts[p_meta["portal"]] = 0
 
-    # 6. Playwright Crawl for GeM BidPlus
+    # 7. Playwright Crawl for GeM BidPlus
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -461,32 +508,32 @@ def run_pipeline():
     except Exception as e:
         print(f"GeM crawler notice: {e}")
 
-    # 7. Aggregator Feeds
+    # 8. Aggregator Feeds
     print("Querying Pan-India aggregator feeds...")
     agg_records = crawl_aggregators_live()
     live_tenders.extend(agg_records)
 
-    # 8. Update Last Crawl Timestamp & Tender Count Across ALL 109 Rows in Portal_Directory
+    # 9. Single Batch Write for All 109 Portal Counts (No Quota Exhaustion)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M IST")
     try:
         p_rows = portal_sheet.get_all_values()
-        updates = []
-        for row_idx, r in enumerate(p_rows[1:], start=2):
-            p_name = r[0]
-            count = portal_counts.get(p_name, 0)
-            updates.append({"range": f"F{row_idx}:G{row_idx}", "values": [[now_str, count]]})
-        
-        # Batch update all rows in chunks
-        chunk_size = 30
-        for i in range(0, len(updates), chunk_size):
-            chunk = updates[i:i+chunk_size]
-            for u in chunk:
-                portal_sheet.update(range_name=u["range"], values=u["values"])
-        print(f"Updated crawl timestamps and live counts across all {len(updates)} portals in 'Portal_Directory'.")
+        if len(p_rows) > 1:
+            batch_vals = []
+            for r in p_rows[1:]:
+                p_name = r[0]
+                count = portal_counts.get(p_name, 0)
+                batch_vals.append([now_str, count])
+            
+            end_row = 1 + len(batch_vals)
+            try:
+                portal_sheet.update(range_name=f"F2:G{end_row}", values=batch_vals)
+            except Exception:
+                portal_sheet.update(batch_vals, f"F2:G{end_row}")
+            print(f"Single batch update completed for all {len(batch_vals)} portals in 'Portal_Directory'.")
     except Exception as e:
         print(f"Notice updating Portal_Directory counts: {e}")
 
-    # 9. Deduplicate Live Tenders
+    # 10. Deduplicate Live Tenders
     unique_new_tenders = []
     seen_in_batch = set()
     for t in live_tenders:
@@ -504,7 +551,7 @@ def run_pipeline():
         print("Zero new event tenders published today. Exiting cleanly without dummy data.")
         return
 
-    # 10. Evaluate & Append Real Tenders to Active_Tenders Tab
+    # 11. Evaluate & Append Real Tenders to Active_Tenders Tab
     for item in unique_new_tenders:
         print(f"Evaluating Tender [{item['tender_id']}]: {item['title'][:45]}...")
         decision = evaluate_tender_strictly(item)
@@ -537,4 +584,9 @@ def run_pipeline():
     print(f"Pan-India crawl and evaluation finished successfully for {today}.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    try:
+        run_pipeline()
+    except Exception as fatal_err:
+        print("=== FATAL PIPELINE EXCEPTION TRACEBACK ===")
+        traceback.print_exc()
+        raise fatal_err
