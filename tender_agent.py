@@ -8,6 +8,7 @@ import logging
 import zipfile
 import datetime as dt
 import urllib.parse
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,12 +17,15 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import gspread
+
 from google.oauth2 import service_account
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+
 
 try:
     from playwright.sync_api import sync_playwright
@@ -30,13 +34,16 @@ except Exception:
 
 
 # =============================================================================
-# 1. CONFIG
+# 1. CONFIGURATION
 # =============================================================================
 
 APP_NAME = "Pan-India Tender Intelligence Agent"
 
 IST = dt.timezone(
-    dt.timedelta(hours=5, minutes=30)
+    dt.timedelta(
+        hours=5,
+        minutes=30
+    )
 )
 
 SERVICE_ACCOUNT_FILE = os.getenv(
@@ -49,11 +56,6 @@ SPREADSHEET_ID = os.getenv(
     ""
 )
 
-if not SPREADSHEET_ID:
-    raise RuntimeError(
-        "SPREADSHEET_ID environment variable is missing."
-    )
-
 EXCEL_MASTER_FILE = os.getenv(
     "EXCEL_MASTER_FILE",
     "Pan_India_Tender_URL_Master.xlsx"
@@ -64,10 +66,12 @@ GEMINI_API_KEY = os.getenv(
     ""
 )
 
+# Optional.
+# If blank, code automatically detects a working Gemini model.
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash-lite"
-)
+    ""
+).strip()
 
 GEM_LISTING_URL = os.getenv(
     "GEM_LISTING_URL",
@@ -89,21 +93,23 @@ DOWNLOAD_DIR.mkdir(
 REQUEST_TIMEOUT = int(
     os.getenv(
         "REQUEST_TIMEOUT",
-        "18"
+        "20"
     )
 )
 
 CRAWL_WORKERS = int(
     os.getenv(
         "CRAWL_WORKERS",
-        "12"
+        "10"
     )
 )
 
 MAX_DOC_BYTES = int(
     os.getenv(
         "MAX_DOC_BYTES",
-        str(30 * 1024 * 1024)
+        str(
+            30 * 1024 * 1024
+        )
     )
 )
 
@@ -117,16 +123,25 @@ MAX_DOC_TEXT_CHARS = int(
 MAX_GENERIC_LINKS = int(
     os.getenv(
         "MAX_GENERIC_LINKS",
-        "25"
+        "35"
     )
 )
+
+
+# =============================================================================
+# 2. LOGGING
+# =============================================================================
 
 logging.basicConfig(
     level=os.getenv(
         "LOG_LEVEL",
         "INFO"
     ).upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
 )
 
 log = logging.getLogger(
@@ -135,28 +150,43 @@ log = logging.getLogger(
 
 
 # =============================================================================
-# 2. COMPANY PROFILE
+# 3. COMPANY PROFILE
 # =============================================================================
 
 COMPANY_PROFILE = {
-    "agency_name": "Soul Events and Consultancy",
-    "constitution": "Proprietorship",
 
-    "avg_3yr_turnover_inr": 38046000,
-    "fy_2025_26_turnover_inr": 50411575,
-    "audited_net_worth_inr": 4680004,
+    "agency_name":
+        "Soul Events and Consultancy",
 
-    "max_single_past_work_order_inr": 7898550,
-    "max_two_works_threshold_inr": 7223000,
-    "max_three_works_threshold_inr": 4628443,
+    "constitution":
+        "Proprietorship",
+
+    "avg_3yr_turnover_inr":
+        38_046_000,
+
+    "fy_2025_26_turnover_inr":
+        50_411_575,
+
+    "audited_net_worth_inr":
+        4_680_004,
+
+    "max_single_past_work_order_inr":
+        7_898_550,
+
+    "max_two_works_threshold_inr":
+        7_223_000,
+
+    "max_three_works_threshold_inr":
+        4_628_443,
 }
 
 
 # =============================================================================
-# 3. SEARCH KEYWORDS
+# 4. EVENT / EXHIBITION KEYWORDS
 # =============================================================================
 
 EVENT_KEYWORDS = [
+
     "Event Management",
     "Event Agency",
     "Event Management Agency",
@@ -203,16 +233,16 @@ EVENT_KEYWORDS = [
 
     "AV Production",
     "Audio Visual",
+
     "LED",
     "Sound and Light",
 
     "Stage",
     "Tentage",
     "Decoration",
-    "Venue Management",
 
+    "Venue Management",
     "Hospitality",
-    "Manpower",
 
     "Printing",
     "Branding",
@@ -234,12 +264,14 @@ EVENT_KEYWORDS = [
     "Sports Event",
 
     "Government Function",
+
     "Launch Event",
     "Inauguration",
 ]
 
 
 TENDERISH_TERMS = (
+
     "tender",
     "bid",
     "rfp",
@@ -254,6 +286,7 @@ TENDERISH_TERMS = (
 
 
 DOWNLOADABLE_EXTENSIONS = (
+
     ".pdf",
     ".doc",
     ".docx",
@@ -263,16 +296,39 @@ DOWNLOADABLE_EXTENSIONS = (
 )
 
 
+# Headers/page labels that must never become tender records.
+
+BAD_TENDER_TITLES = {
+
+    "tender",
+    "tender title",
+    "tender/e-auction",
+    "tender / e-auction",
+    "e-auction",
+    "e auction",
+    "procurement",
+    "procurement details",
+    "bid",
+    "bid title",
+    "latest tenders",
+    "active tenders",
+    "tenders",
+    "title",
+}
+
+
 # =============================================================================
-# 4. DATA MODELS
+# 5. DATA MODELS
 # =============================================================================
 
 @dataclass
 class Portal:
+
     portal: str
     category: str
     state: str
     url: str
+
     priority: str = "P2"
     source_type: str = ""
     active: str = "Yes"
@@ -280,11 +336,13 @@ class Portal:
 
 @dataclass
 class CrawlHealth:
+
     portal: str
     url: str
     status: str
 
     discovered_count: int = 0
+
     message: str = ""
 
     checked_at: str = field(
@@ -299,17 +357,26 @@ class CrawlHealth:
 
 @dataclass
 class TenderCandidate:
+
     portal: str
     state: str
     source_url: str
 
     tender_id: str = ""
+
     organization: str = ""
+
     title: str = ""
+
     category: str = ""
 
-    deadline_raw: str = "NOT VERIFIED"
-    estimated_value_raw: str = "NOT VERIFIED"
+    deadline_raw: str = (
+        "NOT VERIFIED"
+    )
+
+    estimated_value_raw: str = (
+        "NOT VERIFIED"
+    )
 
     detail_url: str = ""
 
@@ -321,13 +388,31 @@ class TenderCandidate:
         default_factory=list
     )
 
+
     def stable_key(self):
 
         raw = "|".join([
-            (self.tender_id or "").strip().lower(),
-            (self.organization or "").strip().lower(),
-            (self.title or "").strip().lower(),
-            (self.deadline_raw or "").strip().lower(),
+
+            (
+                self.tender_id
+                or ""
+            ).strip().lower(),
+
+            (
+                self.organization
+                or ""
+            ).strip().lower(),
+
+            (
+                self.title
+                or ""
+            ).strip().lower(),
+
+            (
+                self.deadline_raw
+                or ""
+            ).strip().lower(),
+
             (
                 self.detail_url
                 or self.source_url
@@ -335,120 +420,241 @@ class TenderCandidate:
             ).strip().lower(),
         ])
 
+
         return hashlib.sha256(
-            raw.encode("utf-8")
+            raw.encode(
+                "utf-8"
+            )
         ).hexdigest()[:24]
 
 
 @dataclass
 class DownloadedDocument:
+
     url: str
+
     local_path: str
+
     mime_type: str
+
     text: str
+
     sha256: str
+
     error: str = ""
 
 
 @dataclass
 class QualificationDecision:
+
     status: str
+
     reason: str
+
     action_plan: str
 
 
 # =============================================================================
-# 5. GEMINI STRUCTURED RESPONSE
+# 6. AI STRUCTURED RESPONSE
 # =============================================================================
 
-class EligibilityEvidence(BaseModel):
+class EligibilityEvidence(
+    BaseModel
+):
 
-    tender_reference: str | None = None
-    organisation: str | None = None
-    scope_summary: str | None = None
+    tender_reference: (
+        str | None
+    ) = None
 
-    estimated_value_inr: float | None = None
+    organisation: (
+        str | None
+    ) = None
 
-    emd_inr: float | None = None
-    emd_exemption_explicit: bool | None = None
-    emd_exemption_text: str | None = None
+    scope_summary: (
+        str | None
+    ) = None
 
-    average_turnover_required_inr: float | None = None
-    turnover_years: int | None = None
 
-    msme_turnover_relaxation_explicit: bool | None = None
+    estimated_value_inr: (
+        float | None
+    ) = None
 
-    single_similar_work_required_inr: float | None = None
-    two_similar_works_each_required_inr: float | None = None
-    three_similar_works_each_required_inr: float | None = None
 
-    min_net_worth_required_inr: float | None = None
+    emd_inr: (
+        float | None
+    ) = None
 
-    entity_type_restriction: str | None = None
+    emd_exemption_explicit: (
+        bool | None
+    ) = None
 
-    consortium_or_jv_allowed: bool | None = None
+    emd_exemption_text: (
+        str | None
+    ) = None
 
-    physical_submission_required: bool | None = None
 
-    qcbs_or_technical_pitch: bool | None = None
+    average_turnover_required_inr: (
+        float | None
+    ) = None
 
-    named_celebrity_or_artist_mandate: bool | None = None
+    turnover_years: (
+        int | None
+    ) = None
 
-    submission_deadline: str | None = None
-    pre_bid_date: str | None = None
+    msme_turnover_relaxation_explicit: (
+        bool | None
+    ) = None
 
-    non_core_scope: bool | None = None
-    non_core_scope_reason: str | None = None
 
-    evidence_quotes: list[str] = []
+    single_similar_work_required_inr: (
+        float | None
+    ) = None
 
-    missing_or_unclear_fields: list[str] = []
+    two_similar_works_each_required_inr: (
+        float | None
+    ) = None
+
+    three_similar_works_each_required_inr: (
+        float | None
+    ) = None
+
+
+    experience_requirement_text: (
+        str | None
+    ) = None
+
+
+    min_net_worth_required_inr: (
+        float | None
+    ) = None
+
+
+    entity_type_restriction: (
+        str | None
+    ) = None
+
+
+    consortium_or_jv_allowed: (
+        bool | None
+    ) = None
+
+
+    physical_submission_required: (
+        bool | None
+    ) = None
+
+
+    qcbs_or_technical_pitch: (
+        bool | None
+    ) = None
+
+
+    named_celebrity_or_artist_mandate: (
+        bool | None
+    ) = None
+
+
+    submission_deadline: (
+        str | None
+    ) = None
+
+
+    pre_bid_date: (
+        str | None
+    ) = None
+
+
+    non_core_scope: (
+        bool | None
+    ) = None
+
+
+    non_core_scope_reason: (
+        str | None
+    ) = None
+
+
+    evidence_quotes: list[str] = Field(
+        default_factory=list
+    )
+
+
+    missing_or_unclear_fields: list[str] = Field(
+        default_factory=list
+    )
 
 
 # =============================================================================
-# 6. HELPERS
+# 7. HELPERS
 # =============================================================================
 
-def normalize_space(value):
+def normalize_space(
+    value
+):
 
     return re.sub(
         r"\s+",
         " ",
-        value or ""
+        value
+        or ""
     ).strip()
 
 
-def keyword_hits(text):
+def keyword_hits(
+    text
+):
 
     text_lower = (
-        text or ""
+        text
+        or ""
     ).lower()
 
+
     return [
+
         keyword
-        for keyword in EVENT_KEYWORDS
-        if keyword.lower() in text_lower
+
+        for keyword
+        in EVENT_KEYWORDS
+
+        if keyword.lower()
+        in text_lower
     ]
 
 
-def infer_category(title):
+def infer_category(
+    title
+):
 
-    t = (
-        title or ""
+    text = (
+        title
+        or ""
     ).lower()
 
-    if (
-        "exhibition" in t
-        or "stall" in t
-        or "pavilion" in t
-    ):
-        return "Exhibition / Stall"
-
-    if "empanel" in t:
-        return "Empanelment"
 
     if any(
-        x in t
+        x in text
+        for x in [
+            "exhibition",
+            "stall",
+            "pavilion"
+        ]
+    ):
+
+        return (
+            "Exhibition / Stall"
+        )
+
+
+    if "empanel" in text:
+
+        return (
+            "Empanelment"
+        )
+
+
+    if any(
+        x in text
         for x in [
             "conference",
             "summit",
@@ -456,29 +662,44 @@ def infer_category(title):
             "seminar"
         ]
     ):
-        return "Conference / Conclave"
+
+        return (
+            "Conference / Conclave"
+        )
+
 
     if any(
-        x in t
+        x in text
         for x in [
             "advertising",
             "media campaign",
-            "creative agency"
+            "creative agency",
+            "publicity"
         ]
     ):
-        return "Advertising / Creative / Outreach"
+
+        return (
+            "Advertising / Creative / Outreach"
+        )
+
 
     if any(
-        x in t
+        x in text
         for x in [
             "festival",
             "mela",
             "cultural"
         ]
     ):
-        return "Festival / Mela / Cultural"
 
-    return "Event / Experiential"
+        return (
+            "Festival / Mela / Cultural"
+        )
+
+
+    return (
+        "Event / Experiential"
+    )
 
 
 def safe_urljoin(
@@ -488,49 +709,135 @@ def safe_urljoin(
 
     return urllib.parse.urljoin(
         base,
-        href or ""
+        href
+        or ""
     )
 
 
-def is_downloadable_url(url):
+def is_downloadable_url(
+    url
+):
 
-    path = urllib.parse.urlsplit(
-        url
-    ).path.lower()
+    try:
 
-    return path.endswith(
-        DOWNLOADABLE_EXTENSIONS
+        path = urllib.parse.urlsplit(
+            url
+        ).path.lower()
+
+
+        return path.endswith(
+            DOWNLOADABLE_EXTENSIONS
+        )
+
+    except Exception:
+
+        return False
+
+
+def valid_tender_title(
+    title
+):
+
+    title = normalize_space(
+        title
     )
 
 
-def extract_ref_candidates(text):
+    if not title:
+
+        return False
+
+
+    lower = (
+        title.lower()
+    )
+
+
+    if lower in BAD_TENDER_TITLES:
+
+        return False
+
+
+    if len(
+        title
+    ) < 8:
+
+        return False
+
+
+    # Reject obvious generic navigation text.
+
+    generic_patterns = [
+
+        r"^click here$",
+
+        r"^view details$",
+
+        r"^download$",
+
+        r"^more$",
+
+        r"^read more$",
+
+        r"^details$",
+    ]
+
+
+    for pattern in generic_patterns:
+
+        if re.match(
+            pattern,
+            lower
+        ):
+
+            return False
+
+
+    return True
+
+
+def extract_ref_candidates(
+    text
+):
 
     patterns = [
+
         r"GEM/\d{4}/B/\d+",
 
         r"\b\d{4}_[A-Za-z0-9_-]+_\d+_\d+\b",
 
-        r"\b(?:RFP|EOI|NIT|TENDER|BID)"
-        r"[\s:/-]*"
-        r"[A-Za-z0-9._/-]{3,}\b",
+        (
+            r"\b"
+            r"(?:RFP|EOI|NIT|TENDER|BID)"
+            r"[\s:/-]*"
+            r"[A-Za-z0-9._/-]{3,}"
+            r"\b"
+        ),
     ]
 
+
     output = []
+
 
     for pattern in patterns:
 
         output.extend(
             re.findall(
                 pattern,
-                text or "",
+                text
+                or "",
                 flags=re.I
             )
         )
 
+
     return list(
         dict.fromkeys(
-            normalize_space(x)
-            for x in output
+            normalize_space(
+                item
+            )
+            for item
+            in output
         )
     )
 
@@ -539,55 +846,397 @@ def session_with_headers():
 
     session = requests.Session()
 
+
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/128.0 Safari/537.36"
-        ),
+
+        "User-Agent":
+
+            (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; "
+                "Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/128.0 "
+                "Safari/537.36"
+            ),
 
         "Accept-Language":
+
             "en-IN,en;q=0.9",
     })
+
 
     return session
 
 
 # =============================================================================
-# 7. MASTER PORTAL LOADER
+# 8. STARTUP VALIDATION
 # =============================================================================
 
-def load_master_portals():
+def validate_environment():
+
+    problems = []
+
+
+    if not SPREADSHEET_ID:
+
+        problems.append(
+            "SPREADSHEET_ID GitHub secret/environment variable is missing."
+        )
+
+
+    if not GEMINI_API_KEY:
+
+        problems.append(
+            "GEMINI_API_KEY GitHub secret/environment variable is missing."
+        )
+
+
+    if not os.path.exists(
+        SERVICE_ACCOUNT_FILE
+    ):
+
+        problems.append(
+            f"Google service-account file missing: "
+            f"{SERVICE_ACCOUNT_FILE}"
+        )
+
 
     if not os.path.exists(
         EXCEL_MASTER_FILE
     ):
 
-        raise FileNotFoundError(
-            f"Master Excel not found: "
+        problems.append(
+            f"Tender master Excel missing: "
             f"{EXCEL_MASTER_FILE}"
         )
 
+
+    if problems:
+
+        for item in problems:
+
+            log.error(
+                item
+            )
+
+
+        raise RuntimeError(
+            "Environment validation failed."
+        )
+
+
+# =============================================================================
+# 9. GEMINI MODEL AUTO-DISCOVERY
+# =============================================================================
+
+_SELECTED_GEMINI_MODEL = None
+
+
+def get_working_gemini_model(
+    client
+):
+
+    global _SELECTED_GEMINI_MODEL
+
+
+    if _SELECTED_GEMINI_MODEL:
+
+        return (
+            _SELECTED_GEMINI_MODEL
+        )
+
+
+    available = []
+
+
+    try:
+
+        log.info(
+            "Checking available Gemini models..."
+        )
+
+
+        for model in (
+            client.models.list()
+        ):
+
+            name = getattr(
+                model,
+                "name",
+                ""
+            )
+
+
+            if not name:
+
+                continue
+
+
+            # API may return:
+            # models/gemini-...
+            clean_name = (
+                name.split(
+                    "/"
+                )[-1]
+            )
+
+
+            available.append(
+                clean_name
+            )
+
+
+        log.info(
+            "Gemini models visible to this API key: %s",
+            ", ".join(
+                available[:30]
+            )
+        )
+
+
+    except Exception as error:
+
+        log.warning(
+            "Could not list Gemini models: %s",
+            error
+        )
+
+
+    candidates = []
+
+
+    # User-configured model gets first priority.
+
+    if GEMINI_MODEL:
+
+        candidates.append(
+            GEMINI_MODEL
+        )
+
+
+    # Prefer generally suitable fast text-generation models
+    # if they appear in the account's actual model listing.
+
+    preferred_patterns = [
+
+        "flash-lite",
+
+        "flash",
+    ]
+
+
+    for pattern in preferred_patterns:
+
+        matches = [
+
+            model
+
+            for model
+            in available
+
+            if (
+                "gemini"
+                in model.lower()
+
+                and pattern
+                in model.lower()
+
+                and "embedding"
+                not in model.lower()
+
+                and "image"
+                not in model.lower()
+
+                and "tts"
+                not in model.lower()
+            )
+        ]
+
+
+        # Reverse so newer-looking model names
+        # are normally attempted first.
+
+        matches.sort(
+            reverse=True
+        )
+
+
+        candidates.extend(
+            matches
+        )
+
+
+    # Conservative fallback names.
+    # They are only attempts; a failed one is skipped.
+
+    candidates.extend([
+
+        "gemini-2.5-flash",
+
+        "gemini-2.0-flash",
+
+        "gemini-1.5-flash",
+    ])
+
+
+    candidates = list(
+        dict.fromkeys(
+            candidates
+        )
+    )
+
+
+    if not candidates:
+
+        raise RuntimeError(
+            "No Gemini generation model could be identified."
+        )
+
+
+    # Test each model with a tiny call.
+
+    for model_name in candidates:
+
+        try:
+
+            log.info(
+                "Testing Gemini model: %s",
+                model_name
+            )
+
+
+            test_response = (
+                client.models.generate_content(
+
+                    model=
+                        model_name,
+
+                    contents=
+                        "Reply with exactly: OK",
+
+                    config=
+                        types.GenerateContentConfig(
+                            temperature=0,
+                            max_output_tokens=10
+                        )
+                )
+            )
+
+
+            if test_response.text:
+
+                _SELECTED_GEMINI_MODEL = (
+                    model_name
+                )
+
+
+                log.info(
+                    "Selected Gemini model: %s",
+                    model_name
+                )
+
+
+                return (
+                    model_name
+                )
+
+
+        except Exception as error:
+
+            log.warning(
+                "Gemini model unavailable [%s]: %s",
+                model_name,
+                str(
+                    error
+                )[:200]
+            )
+
+
+    raise RuntimeError(
+        "None of the Gemini generation models "
+        "available to this API key could be used."
+    )
+
+
+# =============================================================================
+# 10. LOAD MASTER PORTALS
+# =============================================================================
+
+def load_master_portals():
+
     df = pd.read_excel(
+
         EXCEL_MASTER_FILE,
-        sheet_name="Tender URL Master",
+
+        sheet_name=
+            "Tender URL Master",
+
         skiprows=2
     )
 
+
+    required_columns = {
+
+        "Portal / Organisation",
+
+        "Category",
+
+        "State/Region",
+
+        "URL",
+
+        "Priority",
+
+        "Source Type",
+
+        "Active",
+    }
+
+
+    missing_columns = (
+
+        required_columns
+        - set(
+            df.columns
+        )
+    )
+
+
+    if missing_columns:
+
+        raise RuntimeError(
+
+            "Master Excel is missing columns: "
+
+            + ", ".join(
+                sorted(
+                    missing_columns
+                )
+            )
+        )
+
+
     portals = []
+
 
     for _, row in df.iterrows():
 
-        if str(
-            row.get(
-                "Active",
-                ""
+        if (
+            str(
+                row.get(
+                    "Active",
+                    ""
+                )
             )
-        ).strip().lower() != "yes":
+            .strip()
+            .lower()
+            != "yes"
+        ):
 
             continue
+
 
         url = str(
             row.get(
@@ -596,66 +1245,85 @@ def load_master_portals():
             )
         ).strip()
 
+
         if not url.startswith(
             (
                 "http://",
                 "https://"
             )
         ):
+
             continue
 
+
         portals.append(
+
             Portal(
-                portal=str(
-                    row.get(
-                        "Portal / Organisation",
-                        ""
-                    )
-                ).strip(),
 
-                category=str(
-                    row.get(
-                        "Category",
-                        ""
-                    )
-                ).strip(),
+                portal=
+                    str(
+                        row.get(
+                            "Portal / Organisation",
+                            ""
+                        )
+                    ).strip(),
 
-                state=str(
-                    row.get(
-                        "State/Region",
-                        ""
-                    )
-                ).strip(),
+                category=
+                    str(
+                        row.get(
+                            "Category",
+                            ""
+                        )
+                    ).strip(),
 
-                url=url,
+                state=
+                    str(
+                        row.get(
+                            "State/Region",
+                            ""
+                        )
+                    ).strip(),
 
-                priority=str(
-                    row.get(
-                        "Priority",
-                        "P2"
-                    )
-                ).strip().upper()
-                or "P2",
+                url=
+                    url,
 
-                source_type=str(
-                    row.get(
-                        "Source Type",
-                        ""
+                priority=
+                    str(
+                        row.get(
+                            "Priority",
+                            "P2"
+                        )
                     )
-                ).strip(),
+                    .strip()
+                    .upper()
+                    or "P2",
+
+                source_type=
+                    str(
+                        row.get(
+                            "Source Type",
+                            ""
+                        )
+                    ).strip(),
             )
         )
 
-    return portals
+
+    return (
+        portals
+    )
 
 
 # =============================================================================
-# 8. PORTAL CRAWLER
+# 11. STANDARD PORTAL CRAWLER
 # =============================================================================
 
 class TenderCrawler:
 
-    def __init__(self):
+
+    def __init__(
+        self
+    ):
 
         self.http = (
             session_with_headers()
@@ -669,15 +1337,22 @@ class TenderCrawler:
 
         try:
 
+            # Dedicated GeM adapter handles GeM.
+
             if (
                 "gem.gov.in"
                 in portal.url.lower()
             ):
 
-                return [], CrawlHealth(
-                    portal.portal,
-                    portal.url,
-                    "SKIPPED_DEDICATED_ADAPTER"
+                return (
+
+                    [],
+
+                    CrawlHealth(
+                        portal.portal,
+                        portal.url,
+                        "DEDICATED_ADAPTER"
+                    )
                 )
 
 
@@ -691,6 +1366,7 @@ class TenderCrawler:
                     )
                 )
 
+
             else:
 
                 items = (
@@ -701,24 +1377,42 @@ class TenderCrawler:
 
 
             return (
+
                 items,
+
                 CrawlHealth(
+
                     portal.portal,
+
                     portal.url,
+
                     "SUCCESS",
-                    len(items)
+
+                    len(
+                        items
+                    )
                 )
             )
 
 
         except requests.exceptions.Timeout:
 
-            return [], CrawlHealth(
-                portal.portal,
-                portal.url,
-                "TIMEOUT",
-                0,
-                "HTTP request timed out"
+            return (
+
+                [],
+
+                CrawlHealth(
+
+                    portal.portal,
+
+                    portal.url,
+
+                    "TIMEOUT",
+
+                    0,
+
+                    "HTTP request timed out"
+                )
             )
 
 
@@ -730,22 +1424,41 @@ class TenderCrawler:
                 None
             )
 
-            status = (
-                "LOGIN_OR_BLOCKED"
-                if code in (
-                    401,
-                    403
-                )
-                else
-                "HTTP_ERROR"
-            )
 
-            return [], CrawlHealth(
-                portal.portal,
-                portal.url,
-                status,
-                0,
-                str(error)[:250]
+            if code in (
+                401,
+                403
+            ):
+
+                status = (
+                    "LOGIN_OR_BLOCKED"
+                )
+
+            else:
+
+                status = (
+                    "HTTP_ERROR"
+                )
+
+
+            return (
+
+                [],
+
+                CrawlHealth(
+
+                    portal.portal,
+
+                    portal.url,
+
+                    status,
+
+                    0,
+
+                    str(
+                        error
+                    )[:250]
+                )
             )
 
 
@@ -755,33 +1468,72 @@ class TenderCrawler:
                 error
             )
 
-            status = (
-                "CAPTCHA_OR_LOGIN"
-                if (
-                    "CAPTCHA" in message
-                    or "LOGIN" in message
-                )
-                else
-                "PARSER_FAILED"
-            )
 
-            return [], CrawlHealth(
-                portal.portal,
-                portal.url,
-                status,
-                0,
-                message[:250]
+            if (
+                "CAPTCHA"
+                in message.upper()
+
+                or "LOGIN"
+                in message.upper()
+            ):
+
+                status = (
+                    "CAPTCHA_OR_LOGIN"
+                )
+
+
+            else:
+
+                status = (
+                    "PARSER_FAILED"
+                )
+
+
+            return (
+
+                [],
+
+                CrawlHealth(
+
+                    portal.portal,
+
+                    portal.url,
+
+                    status,
+
+                    0,
+
+                    message[:250]
+                )
             )
 
 
         except Exception as error:
 
-            return [], CrawlHealth(
-                portal.portal,
-                portal.url,
-                "PARSER_FAILED",
-                0,
-                str(error)[:250]
+            log.exception(
+                "Portal crawler failed: %s",
+                portal.portal
+            )
+
+
+            return (
+
+                [],
+
+                CrawlHealth(
+
+                    portal.portal,
+
+                    portal.url,
+
+                    "PARSER_FAILED",
+
+                    0,
+
+                    str(
+                        error
+                    )[:250]
+                )
             )
 
 
@@ -794,15 +1546,26 @@ class TenderCrawler:
             portal.url.lower()
         )
 
+
         return any(
-            item in url
+
+            item
+            in url
+
             for item in [
+
                 "eprocure.gov.in",
+
                 "etenders.gov.in",
+
                 "tenders.gov.in",
+
                 "tenders.nic.in",
+
                 "etender",
+
                 "eproc",
+
                 ".nic.in",
             ]
         )
@@ -818,10 +1581,39 @@ class TenderCrawler:
     ):
 
         base = (
-            portal.url.rstrip("/")
+            portal.url.rstrip(
+                "/"
+            )
         )
 
-        candidate_urls = [
+
+        candidate_urls = []
+
+
+        # If user already supplied an /app URL,
+        # try it first.
+
+        if "/app" in base.lower():
+
+            separator = (
+                "&"
+                if "?"
+                in base
+                else "?"
+            )
+
+
+            candidate_urls.append(
+
+                base
+                + separator
+                + "page=FrontEndLatestActiveTenders"
+                + "&service=page"
+            )
+
+
+        candidate_urls.extend([
+
             (
                 f"{base}/nicgep/app"
                 "?page=FrontEndLatestActiveTenders"
@@ -841,10 +1633,13 @@ class TenderCrawler:
             ),
 
             base,
-        ]
+        ])
+
 
         html = ""
+
         final_url = ""
+
 
         for url in dict.fromkeys(
             candidate_urls
@@ -854,15 +1649,22 @@ class TenderCrawler:
 
                 response = (
                     self.http.get(
+
                         url,
-                        timeout=REQUEST_TIMEOUT,
-                        allow_redirects=True
+
+                        timeout=
+                            REQUEST_TIMEOUT,
+
+                        allow_redirects=
+                            True
                     )
                 )
+
 
                 if (
                     response.status_code
                     == 200
+
                     and len(
                         response.text
                     ) > 500
@@ -878,6 +1680,7 @@ class TenderCrawler:
 
                     break
 
+
             except requests.RequestException:
 
                 continue
@@ -886,16 +1689,22 @@ class TenderCrawler:
         if not html:
 
             raise RuntimeError(
-                "No usable GePNIC page returned"
+                "No usable GePNIC page returned."
             )
+
+
+        lower_html = (
+            html.lower()
+        )
 
 
         if (
             "captcha"
-            in html.lower()
-            and
-            "latest active tenders"
-            not in html.lower()
+            in lower_html
+
+            and len(
+                html
+            ) < 100000
         ):
 
             raise RuntimeError(
@@ -904,7 +1713,9 @@ class TenderCrawler:
 
 
         soup = BeautifulSoup(
+
             html,
+
             "html.parser"
         )
 
@@ -916,28 +1727,35 @@ class TenderCrawler:
             "tr"
         ):
 
-            text = normalize_space(
+            row_text = normalize_space(
+
                 row.get_text(
                     " ",
                     strip=True
                 )
             )
 
+
             hits = keyword_hits(
-                text
+                row_text
             )
 
+
             if not hits:
+
                 continue
 
 
             cells = [
+
                 normalize_space(
+
                     td.get_text(
                         " ",
                         strip=True
                     )
                 )
+
                 for td
                 in row.find_all(
                     "td"
@@ -948,26 +1766,62 @@ class TenderCrawler:
             if len(
                 cells
             ) < 2:
+
+                continue
+
+
+            # Avoid using table headings as titles.
+            usable_cells = [
+
+                cell
+
+                for cell
+                in cells
+
+                if valid_tender_title(
+                    cell
+                )
+            ]
+
+
+            if not usable_cells:
+
+                continue
+
+
+            # Prefer longest useful field;
+            # generally tender descriptions are longer
+            # than date/ref columns.
+
+            title = max(
+
+                usable_cells,
+
+                key=len
+            )
+
+
+            if not valid_tender_title(
+                title
+            ):
+
                 continue
 
 
             refs = (
                 extract_ref_candidates(
-                    text
+                    row_text
                 )
             )
 
 
             tender_id = (
+
                 refs[0]
+
                 if refs
+
                 else ""
-            )
-
-
-            title = max(
-                cells,
-                key=len
             )
 
 
@@ -985,19 +1839,34 @@ class TenderCrawler:
             ):
 
                 href = safe_urljoin(
+
                     final_url,
+
                     anchor.get(
                         "href"
                     )
                 )
 
-                if (
-                    not href
-                    or href.lower().startswith(
-                        "javascript:"
-                    )
-                ):
+
+                if not href:
+
                     continue
+
+
+                if href.lower().startswith(
+                    "javascript:"
+                ):
+
+                    continue
+
+
+                anchor_text = normalize_space(
+
+                    anchor.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
 
 
                 if is_downloadable_url(
@@ -1010,16 +1879,15 @@ class TenderCrawler:
 
 
                 elif any(
-                    keyword in (
-                        anchor.get_text(
-                            " ",
-                            strip=True
-                        )
+
+                    item
+                    in (
+                        anchor_text
                         + " "
                         + href
                     ).lower()
 
-                    for keyword
+                    for item
                     in TENDERISH_TERMS
                 ):
 
@@ -1029,30 +1897,44 @@ class TenderCrawler:
 
 
             results.append(
+
                 TenderCandidate(
-                    portal=portal.portal,
-                    state=portal.state,
-                    source_url=final_url,
 
-                    tender_id=tender_id,
+                    portal=
+                        portal.portal,
 
-                    organization=portal.portal,
+                    state=
+                        portal.state,
 
-                    title=title[:500],
+                    source_url=
+                        final_url,
 
-                    category=infer_category(
-                        title
-                    ),
+                    tender_id=
+                        tender_id,
 
-                    detail_url=detail_url,
+                    organization=
+                        portal.portal,
 
-                    discovered_doc_urls=list(
-                        dict.fromkeys(
-                            documents
-                        )
-                    ),
+                    title=
+                        title[:500],
 
-                    keyword_hits=hits,
+                    category=
+                        infer_category(
+                            title
+                        ),
+
+                    detail_url=
+                        detail_url,
+
+                    discovered_doc_urls=
+                        list(
+                            dict.fromkeys(
+                                documents
+                            )
+                        ),
+
+                    keyword_hits=
+                        hits,
                 )
             )
 
@@ -1063,7 +1945,7 @@ class TenderCrawler:
 
 
     # =========================================================================
-    # GENERIC WEBSITE
+    # Generic PSU / Organisation Site
     # =========================================================================
 
     def crawl_generic(
@@ -1073,18 +1955,30 @@ class TenderCrawler:
 
         response = (
             self.http.get(
+
                 portal.url,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True
+
+                timeout=
+                    REQUEST_TIMEOUT,
+
+                allow_redirects=
+                    True
             )
         )
+
 
         response.raise_for_status()
 
 
+        lower_page = (
+            response.text.lower()
+        )
+
+
         if (
             "captcha"
-            in response.text.lower()
+            in lower_page
+
             and len(
                 response.text
             ) < 50000
@@ -1096,7 +1990,9 @@ class TenderCrawler:
 
 
         soup = BeautifulSoup(
+
             response.text,
+
             "html.parser"
         )
 
@@ -1110,6 +2006,7 @@ class TenderCrawler:
         ):
 
             label = normalize_space(
+
                 anchor.get_text(
                     " ",
                     strip=True
@@ -1118,10 +2015,12 @@ class TenderCrawler:
 
 
             href = safe_urljoin(
+
                 response.url,
-                anchor[
+
+                anchor.get(
                     "href"
-                ]
+                )
             )
 
 
@@ -1148,53 +2047,76 @@ class TenderCrawler:
                 )
 
 
+        links = list(
+            dict.fromkeys(
+                links
+            )
+        )
+
+
         results = []
 
 
         for (
             label,
             href
-        ) in list(
-            dict.fromkeys(
-                links
-            )
-        )[:MAX_GENERIC_LINKS]:
+        ) in links[
+            :MAX_GENERIC_LINKS
+        ]:
 
 
             if is_downloadable_url(
                 href
             ):
 
-                if keyword_hits(
+                hits = keyword_hits(
                     label
+                )
+
+
+                if (
+                    hits
+                    and valid_tender_title(
+                        label
+                    )
                 ):
 
                     results.append(
+
                         TenderCandidate(
-                            portal=portal.portal,
-                            state=portal.state,
 
-                            source_url=response.url,
+                            portal=
+                                portal.portal,
 
-                            organization=portal.portal,
+                            state=
+                                portal.state,
 
-                            title=label or href,
+                            source_url=
+                                response.url,
 
-                            category=infer_category(
-                                label
-                            ),
+                            organization=
+                                portal.portal,
 
-                            detail_url=href,
+                            title=
+                                label[:500],
+
+                            category=
+                                infer_category(
+                                    label
+                                ),
+
+                            detail_url=
+                                href,
 
                             discovered_doc_urls=[
                                 href
                             ],
 
-                            keyword_hits=keyword_hits(
-                                label
-                            ),
+                            keyword_hits=
+                                hits,
                         )
                     )
+
 
                 continue
 
@@ -1203,9 +2125,14 @@ class TenderCrawler:
 
                 child_response = (
                     self.http.get(
+
                         href,
-                        timeout=REQUEST_TIMEOUT,
-                        allow_redirects=True
+
+                        timeout=
+                            REQUEST_TIMEOUT,
+
+                        allow_redirects=
+                            True
                     )
                 )
 
@@ -1219,12 +2146,15 @@ class TenderCrawler:
 
 
                 child = BeautifulSoup(
+
                     child_response.text,
+
                     "html.parser"
                 )
 
 
                 text = normalize_space(
+
                     child.get_text(
                         " ",
                         strip=True
@@ -1233,6 +2163,7 @@ class TenderCrawler:
 
 
                 hits = keyword_hits(
+
                     text
                     + " "
                     + label
@@ -1240,6 +2171,47 @@ class TenderCrawler:
 
 
                 if not hits:
+
+                    continue
+
+
+                title = (
+                    label
+                )
+
+
+                if not valid_tender_title(
+                    title
+                ):
+
+                    # Try heading.
+
+                    heading = (
+                        child.find(
+                            [
+                                "h1",
+                                "h2",
+                                "h3"
+                            ]
+                        )
+                    )
+
+
+                    if heading:
+
+                        title = normalize_space(
+
+                            heading.get_text(
+                                " ",
+                                strip=True
+                            )
+                        )
+
+
+                if not valid_tender_title(
+                    title
+                ):
+
                     continue
 
 
@@ -1253,12 +2225,12 @@ class TenderCrawler:
                     )
                 ):
 
-                    child_url = (
-                        safe_urljoin(
-                            child_response.url,
-                            child_anchor[
-                                "href"
-                            ]
+                    child_url = safe_urljoin(
+
+                        child_response.url,
+
+                        child_anchor.get(
+                            "href"
                         )
                     )
 
@@ -1279,42 +2251,49 @@ class TenderCrawler:
                 )
 
 
-                title = (
-                    label
-                    or text[:400]
-                )
-
-
                 results.append(
+
                     TenderCandidate(
-                        portal=portal.portal,
-                        state=portal.state,
 
-                        source_url=response.url,
+                        portal=
+                            portal.portal,
 
-                        tender_id=(
-                            refs[0]
-                            if refs
-                            else ""
-                        ),
+                        state=
+                            portal.state,
 
-                        organization=portal.portal,
+                        source_url=
+                            response.url,
 
-                        title=title[:500],
+                        tender_id=
+                            (
+                                refs[0]
+                                if refs
+                                else ""
+                            ),
 
-                        category=infer_category(
-                            title
-                        ),
+                        organization=
+                            portal.portal,
 
-                        detail_url=child_response.url,
+                        title=
+                            title[:500],
 
-                        discovered_doc_urls=list(
-                            dict.fromkeys(
-                                documents
-                            )
-                        )[:20],
+                        category=
+                            infer_category(
+                                title
+                            ),
 
-                        keyword_hits=hits,
+                        detail_url=
+                            child_response.url,
+
+                        discovered_doc_urls=
+                            list(
+                                dict.fromkeys(
+                                    documents
+                                )
+                            )[:20],
+
+                        keyword_hits=
+                            hits,
                     )
                 )
 
@@ -1335,59 +2314,104 @@ class TenderCrawler:
     ):
 
         seen = set()
+
         output = []
 
+
         for tender in items:
+
+            if not valid_tender_title(
+                tender.title
+            ):
+
+                continue
+
 
             key = (
                 tender.stable_key()
             )
 
-            if key not in seen:
 
-                seen.add(
-                    key
-                )
+            if key in seen:
 
-                output.append(
-                    tender
-                )
+                continue
 
-        return output
+
+            seen.add(
+                key
+            )
+
+
+            output.append(
+                tender
+            )
+
+
+        return (
+            output
+        )
 
 
 # =============================================================================
-# 9. GEM CRAWLER
+# 12. GEM CRAWLER
 # =============================================================================
 
 def crawl_gem():
 
     if sync_playwright is None:
 
-        return [], CrawlHealth(
-            "Government e-Marketplace (GeM)",
-            GEM_LISTING_URL,
-            "DEPENDENCY_MISSING",
-            0,
-            "playwright is not installed"
+        return (
+
+            [],
+
+            CrawlHealth(
+
+                "Government e-Marketplace (GeM)",
+
+                GEM_LISTING_URL,
+
+                "DEPENDENCY_MISSING",
+
+                0,
+
+                "Playwright is not installed."
+            )
         )
 
 
     search_terms = [
+
         "Event Management",
+
         "Exhibition",
+
         "Conference",
+
         "Conclave",
+
         "Summit",
+
         "Mela",
+
         "Festival",
+
         "Creative Agency",
+
         "Advertising Agency",
+
         "Brand Activation",
+
         "Audio Visual",
+
         "Sound and Light",
+
         "Empanelment Event",
+
         "Outreach Campaign",
+
+        "Experiential Marketing",
+
+        "Foundation Day",
     ]
 
 
@@ -1400,30 +2424,55 @@ def crawl_gem():
 
             browser = (
                 playwright.chromium.launch(
+
                     headless=True,
 
                     args=[
+
                         "--no-sandbox",
+
                         "--disable-dev-shm-usage",
                     ]
                 )
             )
 
 
+            context = (
+                browser.new_context(
+
+                    user_agent=
+
+                        (
+                            "Mozilla/5.0 "
+                            "(Windows NT 10.0; "
+                            "Win64; x64) "
+                            "AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) "
+                            "Chrome/128.0 "
+                            "Safari/537.36"
+                        )
+                )
+            )
+
+
             page = (
-                browser.new_page()
+                context.new_page()
             )
 
 
             page.goto(
+
                 GEM_LISTING_URL,
+
                 timeout=45000,
-                wait_until="domcontentloaded"
+
+                wait_until=
+                    "domcontentloaded"
             )
 
 
             page.wait_for_timeout(
-                2500
+                3000
             )
 
 
@@ -1435,12 +2484,19 @@ def crawl_gem():
                 search_input = None
 
 
-                for selector in [
+                selectors = [
+
                     'input[placeholder*="Keyword" i]',
+
                     'input[placeholder*="Search" i]',
+
                     'input[type="search"]',
+
                     'input#search_by',
-                ]:
+                ]
+
+
+                for selector in selectors:
 
                     locator = (
                         page.locator(
@@ -1451,6 +2507,7 @@ def crawl_gem():
 
                     if (
                         locator.count()
+
                         and locator.is_visible()
                     ):
 
@@ -1458,7 +2515,9 @@ def crawl_gem():
                             locator
                         )
 
-                        search_ui_found = True
+                        search_ui_found = (
+                            True
+                        )
 
                         break
 
@@ -1474,6 +2533,7 @@ def crawl_gem():
                         ""
                     )
 
+
                     search_input.fill(
                         term
                     )
@@ -1485,7 +2545,7 @@ def crawl_gem():
 
 
                     page.wait_for_timeout(
-                        2000
+                        2500
                     )
 
 
@@ -1496,58 +2556,69 @@ def crawl_gem():
                     )
 
 
-                    for bid_no in re.findall(
-                        r"GEM/\d{4}/B/\d+",
-                        body_text
-                    ):
+                    bid_numbers = re.findall(
 
-                        bid_number = (
+                        r"GEM/\d{4}/B/\d+",
+
+                        body_text
+                    )
+
+
+                    for bid_no in bid_numbers:
+
+                        numeric_bid = (
                             bid_no.split(
                                 "/"
                             )[-1]
                         )
 
 
-                        doc_url = (
+                        document_url = (
+
                             "https://"
                             "bidplus-global.gem.gov.in/"
                             "showbidDocument/"
-                            f"{bid_number}"
+                            f"{numeric_bid}"
                         )
 
 
                         results.append(
+
                             TenderCandidate(
-                                portal=(
+
+                                portal=
+
                                     "Government "
-                                    "e-Marketplace (GeM)"
-                                ),
+                                    "e-Marketplace (GeM)",
 
-                                state="Pan India",
+                                state=
+                                    "Pan India",
 
-                                source_url=(
-                                    GEM_LISTING_URL
-                                ),
+                                source_url=
+                                    GEM_LISTING_URL,
 
-                                tender_id=bid_no,
+                                tender_id=
+                                    bid_no,
 
-                                organization=(
-                                    "NOT VERIFIED"
-                                ),
+                                organization=
+                                    "NOT VERIFIED",
 
-                                title=(
-                                    f"{term} - "
-                                    f"{bid_no}"
-                                ),
+                                title=
 
-                                category=infer_category(
-                                    term
-                                ),
+                                    f"{term} | "
+                                    f"{bid_no}",
 
-                                detail_url=doc_url,
+                                category=
+
+                                    infer_category(
+                                        term
+                                    ),
+
+                                detail_url=
+                                    document_url,
 
                                 discovered_doc_urls=[
-                                    doc_url
+                                    document_url
                                 ],
 
                                 keyword_hits=[
@@ -1560,72 +2631,99 @@ def crawl_gem():
                 except Exception as error:
 
                     log.warning(
+
                         "GeM search failed "
-                        "for %s: %s",
+                        "for [%s]: %s",
 
                         term,
-                        error
+
+                        str(
+                            error
+                        )[:200]
                     )
 
 
             browser.close()
 
 
-            # IMPORTANT:
-            # If we could not even find the search box,
-            # do NOT report SUCCESS with zero tenders.
-
             if not search_ui_found:
 
                 raise RuntimeError(
-                    "GeM search UI not found. "
-                    "Portal structure may have changed."
+
+                    "GeM search UI was not found. "
+                    "Portal layout may have changed."
                 )
 
 
-        deduplicated = {
-            item.tender_id
-            or item.stable_key():
-                item
+        unique = {}
 
-            for item
-            in results
-        }
+
+        for tender in results:
+
+            key = (
+                tender.tender_id
+                or tender.stable_key()
+            )
+
+
+            unique[
+                key
+            ] = tender
 
 
         output = list(
-            deduplicated.values()
+            unique.values()
         )
 
 
         return (
+
             output,
 
             CrawlHealth(
+
                 "Government e-Marketplace (GeM)",
+
                 GEM_LISTING_URL,
+
                 "SUCCESS",
-                len(output)
+
+                len(
+                    output
+                )
             )
         )
 
 
     except Exception as error:
 
-        return [], CrawlHealth(
-            "Government e-Marketplace (GeM)",
-            GEM_LISTING_URL,
-            "PARSER_FAILED",
-            0,
-            str(error)[:250]
+        return (
+
+            [],
+
+            CrawlHealth(
+
+                "Government e-Marketplace (GeM)",
+
+                GEM_LISTING_URL,
+
+                "PARSER_FAILED",
+
+                0,
+
+                str(
+                    error
+                )[:250]
+            )
         )
 
 
 # =============================================================================
-# 10. DOCUMENT MANAGER
+# 13. DOCUMENT MANAGER
 # =============================================================================
 
 class DocumentManager:
+
 
     def __init__(
         self
@@ -1663,6 +2761,7 @@ class DocumentManager:
                 candidate.detail_url
             )
 
+
             return list(
                 dict.fromkeys(
                     urls
@@ -1674,9 +2773,14 @@ class DocumentManager:
 
             response = (
                 self.http.get(
+
                     candidate.detail_url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True
+
+                    timeout=
+                        REQUEST_TIMEOUT,
+
+                    allow_redirects=
+                        True
                 )
             )
 
@@ -1693,10 +2797,65 @@ class DocumentManager:
                 )
 
 
+            content_type = (
+
+                response.headers.get(
+                    "content-type"
+                )
+                or ""
+
+            ).lower()
+
+
+            if (
+                "application/pdf"
+                in content_type
+            ):
+
+                urls.append(
+                    response.url
+                )
+
+
+                return list(
+                    dict.fromkeys(
+                        urls
+                    )
+                )
+
+
             soup = BeautifulSoup(
+
                 response.text,
+
                 "html.parser"
             )
+
+
+            relevant_labels = [
+
+                "download",
+
+                "tender document",
+
+                "rfp",
+
+                "atc",
+
+                "corrigendum",
+
+                "nit",
+
+                "boq",
+
+                "annexure",
+
+                "eligibility",
+
+                "pre-bid",
+
+                "pre bid",
+            ]
 
 
             for anchor in soup.find_all(
@@ -1705,14 +2864,17 @@ class DocumentManager:
             ):
 
                 url = safe_urljoin(
+
                     response.url,
-                    anchor[
+
+                    anchor.get(
                         "href"
-                    ]
+                    )
                 )
 
 
                 label = normalize_space(
+
                     anchor.get_text(
                         " ",
                         strip=True
@@ -1721,25 +2883,15 @@ class DocumentManager:
 
 
                 if (
+
                     is_downloadable_url(
                         url
                     )
-                    or any(
-                        item
-                        in label
 
-                        for item in [
-                            "download",
-                            "tender document",
-                            "rfp",
-                            "atc",
-                            "corrigendum",
-                            "nit",
-                            "boq",
-                            "annexure",
-                            "pre-bid",
-                            "pre bid",
-                        ]
+                    or any(
+                        item in label
+                        for item
+                        in relevant_labels
                     )
                 ):
 
@@ -1770,9 +2922,15 @@ class DocumentManager:
 
             response = (
                 self.http.get(
+
                     url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
+
+                    timeout=
+                        REQUEST_TIMEOUT,
+
+                    allow_redirects=
+                        True,
+
                     stream=True
                 )
             )
@@ -1782,23 +2940,24 @@ class DocumentManager:
 
 
             content_type = (
+
                 response.headers.get(
                     "content-type"
                 )
                 or ""
+
             ).lower()
 
 
             data = bytearray()
 
 
-            for chunk in (
-                response.iter_content(
-                    65536
-                )
+            for chunk in response.iter_content(
+                65536
             ):
 
                 if not chunk:
+
                     continue
 
 
@@ -1808,14 +2967,16 @@ class DocumentManager:
 
 
                 if (
-                    len(data)
-                    >
-                    MAX_DOC_BYTES
+                    len(
+                        data
+                    )
+                    > MAX_DOC_BYTES
                 ):
 
                     raise ValueError(
-                        "Document exceeds "
-                        "configured size limit"
+
+                        "Document exceeded "
+                        "configured size limit."
                     )
 
 
@@ -1831,27 +2992,36 @@ class DocumentManager:
 
             extension = (
                 self._guess_ext(
+
                     response.url,
+
                     content_type,
+
                     raw
                 )
             )
 
 
             folder = (
+
                 DOWNLOAD_DIR
+
                 / tender_key
             )
 
 
             folder.mkdir(
+
                 parents=True,
+
                 exist_ok=True
             )
 
 
-            path = (
+            filepath = (
+
                 folder
+
                 / (
                     f"{sha256[:12]}"
                     f"{extension}"
@@ -1859,44 +3029,67 @@ class DocumentManager:
             )
 
 
-            path.write_bytes(
+            filepath.write_bytes(
                 raw
             )
 
 
-            text = (
-                self._extract_text(
-                    raw,
-                    extension,
-                    content_type
-                )
+            text = self._extract_text(
+
+                raw,
+
+                extension,
+
+                content_type
             )
 
 
             return DownloadedDocument(
-                url=response.url,
-                local_path=str(
-                    path
-                ),
-                mime_type=content_type,
-                text=text[
-                    :MAX_DOC_TEXT_CHARS
-                ],
-                sha256=sha256
+
+                url=
+                    response.url,
+
+                local_path=
+                    str(
+                        filepath
+                    ),
+
+                mime_type=
+                    content_type,
+
+                text=
+                    text[
+                        :MAX_DOC_TEXT_CHARS
+                    ],
+
+                sha256=
+                    sha256
             )
 
 
         except Exception as error:
 
             return DownloadedDocument(
-                url=url,
-                local_path="",
-                mime_type="",
-                text="",
-                sha256="",
-                error=str(
-                    error
-                )[:400]
+
+                url=
+                    url,
+
+                local_path=
+                    "",
+
+                mime_type=
+                    "",
+
+                text=
+                    "",
+
+                sha256=
+                    "",
+
+                error=
+                    str(
+                        error
+                    )[:400]
             )
 
 
@@ -1908,51 +3101,73 @@ class DocumentManager:
     ):
 
         extension = Path(
+
             urllib.parse.urlsplit(
                 url
             ).path
+
         ).suffix.lower()
 
 
-        if (
-            extension
-            in DOWNLOADABLE_EXTENSIONS
+        if extension in (
+            DOWNLOADABLE_EXTENSIONS
         ):
-            return extension
+
+            return (
+                extension
+            )
 
 
         if (
+
             raw.startswith(
                 b"%PDF"
             )
-            or
-            "application/pdf"
+
+            or "application/pdf"
             in content_type
         ):
-            return ".pdf"
+
+            return (
+                ".pdf"
+            )
 
 
         if raw.startswith(
             b"PK\x03\x04"
         ):
-            return ".zip"
+
+            # OOXML files and ZIPs share this signature.
+            # Use MIME where possible.
+
+            if (
+                "spreadsheetml"
+                in content_type
+            ):
+
+                return (
+                    ".xlsx"
+                )
 
 
-        if (
-            "wordprocessingml"
-            in content_type
-        ):
-            return ".docx"
+            if (
+                "wordprocessingml"
+                in content_type
+            ):
+
+                return (
+                    ".docx"
+                )
 
 
-        if (
-            "spreadsheetml"
-            in content_type
-        ):
-            return ".xlsx"
+            return (
+                ".zip"
+            )
 
 
-        return ".bin"
+        return (
+            ".bin"
+        )
 
 
     def _extract_text(
@@ -1963,25 +3178,29 @@ class DocumentManager:
     ):
 
         if extension == ".pdf":
+
             return self._pdf_text(
                 raw
             )
 
 
         if extension == ".docx":
+
             return self._docx_text(
                 raw
             )
 
 
-        if extension == ".zip":
-            return self._zip_text(
+        if extension == ".xlsx":
+
+            return self._excel_text(
                 raw
             )
 
 
-        if extension == ".xlsx":
-            return self._excel_text(
+        if extension == ".zip":
+
+            return self._zip_text(
                 raw
             )
 
@@ -1992,12 +3211,16 @@ class DocumentManager:
         ):
 
             return raw.decode(
+
                 "utf-8",
+
                 errors="ignore"
             )
 
 
-        return ""
+        return (
+            ""
+        )
 
 
     def _pdf_text(
@@ -2008,24 +3231,47 @@ class DocumentManager:
         try:
 
             reader = PdfReader(
+
                 io.BytesIO(
                     raw
                 )
             )
 
 
-            return "\n".join(
-                page.extract_text()
-                or ""
+            pages = []
 
-                for page
-                in reader.pages
+
+            for page_number, page in enumerate(
+                reader.pages
+            ):
+
+                text = (
+                    page.extract_text()
+                    or ""
+                )
+
+
+                if text:
+
+                    pages.append(
+
+                        f"\n"
+                        f"--- PDF PAGE "
+                        f"{page_number + 1} ---\n"
+                        f"{text}"
+                    )
+
+
+            return "\n".join(
+                pages
             )
 
 
         except Exception:
 
-            return ""
+            return (
+                ""
+            )
 
 
     def _docx_text(
@@ -2036,111 +3282,55 @@ class DocumentManager:
         try:
 
             document = DocxDocument(
+
                 io.BytesIO(
                     raw
                 )
             )
 
 
-            return "\n".join(
-                paragraph.text
-                for paragraph
-                in document.paragraphs
-            )
+            parts = []
 
 
-        except Exception:
+            for paragraph in (
+                document.paragraphs
+            ):
 
-            return ""
+                if paragraph.text.strip():
 
-
-    def _zip_text(
-        self,
-        raw
-    ):
-
-        chunks = []
-
-
-        try:
-
-            with zipfile.ZipFile(
-                io.BytesIO(
-                    raw
-                )
-            ) as archive:
-
-
-                for info in (
-                    archive.infolist()[:50]
-                ):
-
-                    extension = Path(
-                        info.filename
-                    ).suffix.lower()
-
-
-                    if extension not in (
-                        ".pdf",
-                        ".docx",
-                        ".txt",
-                        ".xlsx"
-                    ):
-                        continue
-
-
-                    data = archive.read(
-                        info
+                    parts.append(
+                        paragraph.text
                     )
 
 
-                    if extension == ".pdf":
+            # Include tables.
 
-                        text = self._pdf_text(
-                            data
+            for table in document.tables:
+
+                for row in table.rows:
+
+                    parts.append(
+
+                        " | ".join(
+
+                            cell.text
+
+                            for cell
+                            in row.cells
                         )
+                    )
 
 
-                    elif extension == ".docx":
-
-                        text = self._docx_text(
-                            data
-                        )
-
-
-                    elif extension == ".xlsx":
-
-                        text = self._excel_text(
-                            data
-                        )
-
-
-                    else:
-
-                        text = data.decode(
-                            "utf-8",
-                            errors="ignore"
-                        )
-
-
-                    if text:
-
-                        chunks.append(
-                            "\n--- FILE: "
-                            f"{info.filename}"
-                            " ---\n"
-                            f"{text}"
-                        )
+            return "\n".join(
+                parts
+            )
 
 
         except Exception:
 
-            pass
-
-
-        return "\n".join(
-            chunks
-        )
+            return (
+                ""
+            )
 
 
     def _excel_text(
@@ -2151,6 +3341,7 @@ class DocumentManager:
         try:
 
             excel = pd.ExcelFile(
+
                 io.BytesIO(
                     raw
                 )
@@ -2160,33 +3351,41 @@ class DocumentManager:
             parts = []
 
 
-            for sheet in (
-                excel.sheet_names[:15]
+            for sheet_name in (
+                excel.sheet_names[:20]
             ):
 
                 dataframe = pd.read_excel(
+
                     io.BytesIO(
                         raw
                     ),
-                    sheet_name=sheet,
+
+                    sheet_name=
+                        sheet_name,
+
                     header=None
                 )
 
 
                 parts.append(
-                    "\n--- SHEET: "
-                    f"{sheet}"
-                    " ---\n"
+
+                    f"\n"
+                    f"--- SHEET: "
+                    f"{sheet_name} ---\n"
                 )
 
 
                 parts.append(
+
                     dataframe
                     .astype(
                         str
                     )
                     .to_csv(
+
                         index=False,
+
                         header=False
                     )
                 )
@@ -2199,11 +3398,130 @@ class DocumentManager:
 
         except Exception:
 
-            return ""
+            return (
+                ""
+            )
+
+
+    def _zip_text(
+        self,
+        raw
+    ):
+
+        results = []
+
+
+        try:
+
+            with zipfile.ZipFile(
+
+                io.BytesIO(
+                    raw
+                )
+
+            ) as archive:
+
+
+                for entry in (
+                    archive.infolist()[:75]
+                ):
+
+                    extension = Path(
+                        entry.filename
+                    ).suffix.lower()
+
+
+                    if extension not in (
+
+                        ".pdf",
+
+                        ".docx",
+
+                        ".xlsx",
+
+                        ".txt"
+                    ):
+
+                        continue
+
+
+                    # Avoid huge nested files.
+
+                    if (
+                        entry.file_size
+                        > MAX_DOC_BYTES
+                    ):
+
+                        continue
+
+
+                    data = archive.read(
+                        entry
+                    )
+
+
+                    if extension == ".pdf":
+
+                        text = (
+                            self._pdf_text(
+                                data
+                            )
+                        )
+
+
+                    elif extension == ".docx":
+
+                        text = (
+                            self._docx_text(
+                                data
+                            )
+                        )
+
+
+                    elif extension == ".xlsx":
+
+                        text = (
+                            self._excel_text(
+                                data
+                            )
+                        )
+
+
+                    else:
+
+                        text = (
+                            data.decode(
+
+                                "utf-8",
+
+                                errors="ignore"
+                            )
+                        )
+
+
+                    if text:
+
+                        results.append(
+
+                            f"\n"
+                            f"--- ZIP FILE: "
+                            f"{entry.filename} ---\n"
+                            f"{text}"
+                        )
+
+
+        except Exception:
+
+            pass
+
+
+        return "\n".join(
+            results
+        )
 
 
 # =============================================================================
-# 11. GEMINI ELIGIBILITY EXTRACTION
+# 14. GEMINI ELIGIBILITY EXTRACTION
 # =============================================================================
 
 def extract_eligibility(
@@ -2211,15 +3529,37 @@ def extract_eligibility(
     documents
 ):
 
-    usable_documents = [
+    usable = [
+
         document
+
         for document
         in documents
+
         if document.text.strip()
     ]
 
 
-    combined_text = "\n\n".join(
+    if not usable:
+
+        return {
+
+            "extraction_status":
+                "NO_DOCUMENT_TEXT",
+
+            "missing_or_unclear_fields": [
+
+                "Tender document text "
+                "could not be extracted."
+            ],
+
+            "evidence_quotes":
+                [],
+        }
+
+
+    combined = "\n\n".join(
+
         (
             f"SOURCE URL: "
             f"{document.url}\n"
@@ -2231,106 +3571,139 @@ def extract_eligibility(
         )
 
         for document
-        in usable_documents
+        in usable
+
     )[:MAX_DOC_TEXT_CHARS]
 
 
-    if not combined_text:
-
-        return {
-            "extraction_status":
-                "NO_DOCUMENT_TEXT",
-
-            "missing_or_unclear_fields": [
-                "Tender document text "
-                "could not be extracted"
-            ],
-
-            "evidence_quotes":
-                [],
-        }
-
-
-    if not GEMINI_API_KEY:
-
-        return {
-            "extraction_status":
-                "DOCUMENT_TEXT_AVAILABLE_"
-                "AI_NOT_CONFIGURED",
-
-            "missing_or_unclear_fields": [
-                "GEMINI_API_KEY "
-                "is not configured"
-            ],
-
-            "evidence_quotes":
-                [],
-        }
-
-
     client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
 
-
-    prompt = (
-        "You are extracting procurement eligibility facts "
-        "from government tender documents.\n\n"
-
-        "STRICT RULES:\n"
-
-        "- Extract ONLY facts explicitly supported by the document text.\n"
-
-        "- Never assume MSME exemption, EMD exemption, turnover, "
-        "experience rules, deadlines, 80/50/40 rules, or standard terms.\n"
-
-        "- If a criterion is absent or unclear, return null.\n"
-
-        "- INR amounts must be numeric rupees.\n"
-
-        "- evidence_quotes must contain short exact source snippets.\n"
-
-        "- Identify entity-type restrictions.\n"
-
-        "- Identify JV / consortium permissions.\n"
-
-        "- Identify physical submission requirements.\n"
-
-        "- Identify QCBS or technical presentation requirements.\n"
-
-        "- Identify celebrity / artist mandate requirements.\n"
-
-        "- Add all important unclear or missing eligibility items "
-        "to missing_or_unclear_fields.\n\n"
-
-        "DISCOVERED TENDER:\n"
-
-        + json.dumps(
-            asdict(
-                candidate
-            ),
-            ensure_ascii=False,
-            indent=2
-        )
-
-        + "\n\nDOCUMENT TEXT:\n"
-
-        + combined_text
+        api_key=
+            GEMINI_API_KEY
     )
 
 
     try:
 
+        model_name = (
+            get_working_gemini_model(
+                client
+            )
+        )
+
+
+    except Exception as error:
+
+        return {
+
+            "extraction_status":
+                "AI_MODEL_UNAVAILABLE",
+
+            "missing_or_unclear_fields": [
+
+                str(
+                    error
+                )[:350]
+            ],
+
+            "evidence_quotes":
+                [],
+        }
+
+
+    prompt = (
+
+        "You are an Indian government procurement "
+        "tender eligibility extraction engine.\n\n"
+
+        "Your job is to EXTRACT FACTS. "
+        "Do not decide whether the bidder qualifies.\n\n"
+
+        "MANDATORY RULES:\n"
+
+        "1. Extract ONLY information explicitly "
+        "supported by the supplied tender documents.\n"
+
+        "2. NEVER assume standard GFR, GeM, MSME, "
+        "EMD, turnover, experience, 80/50/40, "
+        "consortium, or exemption rules.\n"
+
+        "3. If something is not stated, use null.\n"
+
+        "4. Do not convert an unstated requirement "
+        "into zero.\n"
+
+        "5. Monetary values must be converted to "
+        "numeric INR values where explicitly stated.\n"
+
+        "6. If 'two similar works' or 'three similar "
+        "works' requirements exist, capture the "
+        "required amount PER WORK.\n"
+
+        "7. entity_type_restriction must capture "
+        "whether proprietorship / partnership / LLP / "
+        "private limited / public limited entities "
+        "are allowed or restricted.\n"
+
+        "8. experience_requirement_text should preserve "
+        "the actual experience clause in concise form.\n"
+
+        "9. Add short exact document snippets to "
+        "evidence_quotes for important criteria.\n"
+
+        "10. Add uncertain or missing critical fields "
+        "to missing_or_unclear_fields.\n\n"
+
+        "DISCOVERED TENDER METADATA:\n"
+
+        + json.dumps(
+
+            asdict(
+                candidate
+            ),
+
+            ensure_ascii=False,
+
+            indent=2
+        )
+
+        + "\n\n"
+
+        + "TENDER DOCUMENT CONTENT:\n"
+
+        + combined
+    )
+
+
+    try:
+
+        log.info(
+            "Extracting eligibility using Gemini model: %s",
+            model_name
+        )
+
+
         response = (
             client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
 
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=EligibilityEvidence,
-                    temperature=0,
-                ),
+                model=
+                    model_name,
+
+                contents=
+                    prompt,
+
+                config=
+                    types.GenerateContentConfig(
+
+                        response_mime_type=
+                            "application/json",
+
+                        response_schema=
+                            EligibilityEvidence,
+
+                        temperature=
+                            0,
+                    )
             )
         )
 
@@ -2347,16 +3720,33 @@ def extract_eligibility(
         )
 
 
-        return data
+        data[
+            "gemini_model_used"
+        ] = (
+            model_name
+        )
+
+
+        return (
+            data
+        )
 
 
     except Exception as error:
 
+        log.error(
+            "Eligibility extraction failed: %s",
+            error
+        )
+
+
         return {
+
             "extraction_status":
                 "AI_EXTRACTION_FAILED",
 
             "missing_or_unclear_fields": [
+
                 str(
                     error
                 )[:350]
@@ -2368,33 +3758,41 @@ def extract_eligibility(
 
 
 # =============================================================================
-# 12. QUALIFICATION ENGINE
+# 15. QUALIFICATION ENGINE
 # =============================================================================
 
 def evaluate_qualification(
     evidence
 ):
 
-    # -------------------------------------------------------------------------
-    # No verified extraction
-    # -------------------------------------------------------------------------
-
-    if (
+    extraction_status = (
         evidence.get(
             "extraction_status"
         )
+    )
+
+
+    if (
+        extraction_status
         !=
         "DOCUMENT_VERIFIED_EXTRACTION"
     ):
 
         return QualificationDecision(
-            "DOCUMENT REVIEW REQUIRED",
 
-            "Verified structured eligibility evidence "
-            "is not available.",
+            status=
+                "DOCUMENT REVIEW REQUIRED",
 
-            "Open the source tender documents and review "
-            "the eligibility clauses manually."
+            reason=
+
+                "Verified structured "
+                "eligibility evidence "
+                "is not available.",
+
+            action_plan=
+
+                "Review the source tender "
+                "documents manually."
         )
 
 
@@ -2402,10 +3800,12 @@ def evaluate_qualification(
 
 
     entity = (
+
         evidence.get(
             "entity_type_restriction"
         )
         or ""
+
     ).lower()
 
 
@@ -2451,39 +3851,51 @@ def evaluate_qualification(
     )
 
 
-    # -------------------------------------------------------------------------
-    # Entity restriction
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Entity type
+    # =========================================================================
 
-    if (
-        entity
-        and (
-            "private limited"
-            in entity
+    if entity:
 
-            or "public limited"
-            in entity
+        company_only_terms = [
 
-            or "company only"
-            in entity
-        )
-        and
-        "propriet"
-        not in entity
-    ):
+            "private limited only",
 
-        fail_reasons.append(
-            "Entity type restriction "
-            "conflicts with proprietorship."
-        )
+            "public limited only",
+
+            "companies only",
+
+            "company only",
+        ]
 
 
-    # -------------------------------------------------------------------------
+        if (
+
+            any(
+                term in entity
+                for term
+                in company_only_terms
+            )
+
+            and "propriet"
+            not in entity
+        ):
+
+            fail_reasons.append(
+
+                "Tender entity restriction "
+                "does not permit a proprietorship."
+            )
+
+
+    # =========================================================================
     # Turnover
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     if (
-        turnover is not None
+
+        turnover
+        is not None
 
         and turnover
         >
@@ -2498,19 +3910,24 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
-            "Required turnover "
+
+            "Required average turnover "
+
             f"₹{turnover:,.0f} "
-            "exceeds benchmark "
+
+            "exceeds audited benchmark "
+
             f"₹"
             f"{COMPANY_PROFILE['avg_3yr_turnover_inr']:,.0f}."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Single similar work
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Experience
+    # =========================================================================
 
     if (
+
         single_work
         is not None
 
@@ -2525,19 +3942,20 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
-            "Single similar work requirement "
+
+            "Required single similar work "
+
             f"₹{single_work:,.0f} "
+
             "exceeds benchmark "
+
             f"₹"
             f"{COMPANY_PROFILE['max_single_past_work_order_inr']:,.0f}."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Two-work threshold
-    # -------------------------------------------------------------------------
-
     if (
+
         two_work
         is not None
 
@@ -2552,19 +3970,21 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
-            "Two-work threshold "
+
+            "Required value for each of two "
+            "similar works "
+
             f"₹{two_work:,.0f} "
+
             "exceeds benchmark "
+
             f"₹"
             f"{COMPANY_PROFILE['max_two_works_threshold_inr']:,.0f}."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Three-work threshold
-    # -------------------------------------------------------------------------
-
     if (
+
         three_work
         is not None
 
@@ -2579,19 +3999,25 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
-            "Three-work threshold "
+
+            "Required value for each of three "
+            "similar works "
+
             f"₹{three_work:,.0f} "
+
             "exceeds benchmark "
+
             f"₹"
             f"{COMPANY_PROFILE['max_three_works_threshold_inr']:,.0f}."
         )
 
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Net worth
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     if (
+
         net_worth
         is not None
 
@@ -2603,17 +4029,21 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
+
             "Required net worth "
+
             f"₹{net_worth:,.0f} "
+
             "exceeds audited benchmark "
+
             f"₹"
             f"{COMPANY_PROFILE['audited_net_worth_inr']:,.0f}."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Non-core scope
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Non-core
+    # =========================================================================
 
     if (
         evidence.get(
@@ -2623,33 +4053,41 @@ def evaluate_qualification(
     ):
 
         fail_reasons.append(
-            "Tender scope is outside "
-            "the configured event / "
-            "experiential core scope."
+
+            "The principal scope is outside "
+            "the configured event / exhibition / "
+            "experiential service capability."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Hard disqualification
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # HARD FAIL
+    # =========================================================================
 
     if fail_reasons:
 
         return QualificationDecision(
-            "VERIFIED DISQUALIFIED",
 
-            " ".join(
-                fail_reasons
-            ),
+            status=
+                "VERIFIED DISQUALIFIED",
 
-            "Do not bid unless clarification, amendment "
-            "or permitted JV resolves the blocker."
+            reason=
+                " ".join(
+                    fail_reasons
+                ),
+
+            action_plan=
+
+                "Do not submit without checking "
+                "whether an amendment, relaxation, "
+                "or permitted JV structure can resolve "
+                "the eligibility blocker."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Manual intervention
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # MANUAL INTERVENTION
+    # =========================================================================
 
     manual_reasons = []
 
@@ -2662,7 +4100,9 @@ def evaluate_qualification(
     ):
 
         manual_reasons.append(
-            "Physical submission requirement"
+
+            "Physical submission / DD / BG "
+            "or offline document requirement"
         )
 
 
@@ -2674,7 +4114,9 @@ def evaluate_qualification(
     ):
 
         manual_reasons.append(
-            "QCBS / technical presentation"
+
+            "QCBS / technical presentation "
+            "or creative pitch required"
         )
 
 
@@ -2686,64 +4128,81 @@ def evaluate_qualification(
     ):
 
         manual_reasons.append(
-            "Artist / celebrity mandate"
+
+            "Named artist / celebrity mandate "
+            "or authorization required"
         )
 
 
     if manual_reasons:
 
         return QualificationDecision(
-            "NEEDS MANUAL INTERVENTION",
 
-            "; ".join(
-                manual_reasons
-            ),
+            status=
+                "NEEDS MANUAL INTERVENTION",
 
-            "Review submission logistics and "
-            "commercial / technical feasibility."
+            reason=
+                "; ".join(
+                    manual_reasons
+                ),
+
+            action_plan=
+
+                "Review commercial feasibility, "
+                "submission logistics and required "
+                "supporting documents before bidding."
         )
 
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # CRITICAL COMPLETENESS CHECK
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     critical_missing = []
 
 
+    # We must know something about turnover.
+    # This can be a number OR explicit evidence that
+    # no minimum turnover is stipulated.
+
     if (
-        evidence.get(
-            "average_turnover_required_inr"
-        )
+        turnover
         is None
     ):
 
         critical_missing.append(
-            "Turnover requirement"
+
+            "Average turnover requirement "
+            "not conclusively verified"
         )
 
+
+    # Experience criterion.
 
     if (
-        evidence.get(
-            "single_similar_work_required_inr"
-        )
+
+        single_work
         is None
 
-        and evidence.get(
-            "two_similar_works_each_required_inr"
-        )
+        and two_work
         is None
 
-        and evidence.get(
-            "three_similar_works_each_required_inr"
-        )
+        and three_work
         is None
+
+        and not evidence.get(
+            "experience_requirement_text"
+        )
     ):
 
         critical_missing.append(
-            "Past experience requirement"
+
+            "Past/similar-work experience "
+            "requirement not conclusively verified"
         )
 
+
+    # Entity restriction.
 
     if (
         evidence.get(
@@ -2753,13 +4212,32 @@ def evaluate_qualification(
     ):
 
         critical_missing.append(
-            "Entity-type eligibility"
+
+            "Entity constitution eligibility "
+            "not conclusively verified"
         )
 
 
-    # Use Gemini's own uncertainty list too
+    # Submission deadline is operationally critical.
 
-    unclear = (
+    if (
+        evidence.get(
+            "submission_deadline"
+        )
+        is None
+    ):
+
+        critical_missing.append(
+
+            "Submission deadline "
+            "not verified"
+        )
+
+
+    # Use model uncertainty as well.
+
+    unclear_items = (
+
         evidence.get(
             "missing_or_unclear_fields"
         )
@@ -2767,33 +4245,44 @@ def evaluate_qualification(
     )
 
 
-    critical_keywords = (
+    critical_terms = (
+
         "turnover",
+
         "experience",
+
         "similar work",
+
         "entity",
+
         "constitution",
-        "net worth",
-        "qualification",
+
         "eligibility",
+
+        "qualification",
+
+        "net worth",
     )
 
 
-    for item in unclear:
+    for item in unclear_items:
+
+        item_text = str(
+            item
+        )
+
 
         if any(
-            keyword in str(
-                item
-            ).lower()
 
-            for keyword
-            in critical_keywords
+            term
+            in item_text.lower()
+
+            for term
+            in critical_terms
         ):
 
             critical_missing.append(
-                str(
-                    item
-                )
+                item_text
             )
 
 
@@ -2807,127 +4296,206 @@ def evaluate_qualification(
     if critical_missing:
 
         return QualificationDecision(
-            "DOCUMENT REVIEW REQUIRED",
 
-            "Critical eligibility fields "
-            "could not be fully verified: "
-            + "; ".join(
-                critical_missing[:8]
-            ),
+            status=
+                "DOCUMENT REVIEW REQUIRED",
 
-            "Review the eligibility/PQC/ATC clauses "
-            "before treating this tender as qualified."
+            reason=
+
+                "The documents were read, "
+                "but critical eligibility information "
+                "could not be fully verified: "
+
+                + "; ".join(
+                    critical_missing[:8]
+                ),
+
+            action_plan=
+
+                "Review the Eligibility / PQC / ATC / "
+                "Experience clauses manually before "
+                "treating this opportunity as qualified."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Verified qualified
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # VERIFIED QUALIFIED
+    # =========================================================================
 
     return QualificationDecision(
-        "VERIFIED QUALIFIED",
 
-        "No disqualifying condition was found "
-        "in the verified eligibility evidence.",
+        status=
+            "VERIFIED QUALIFIED",
 
-        "Proceed to technical / commercial bid preparation "
-        "and verify the latest corrigenda before submission."
+        reason=
+
+            "No disqualifying condition was found "
+            "after document-based eligibility extraction "
+            "against the configured Soul Events benchmarks.",
+
+        action_plan=
+
+            "Proceed with technical/commercial bid "
+            "preparation and verify the latest corrigenda "
+            "before final submission."
     )
 
 
 # =============================================================================
-# 13. GOOGLE SHEET COLUMNS
+# 16. GOOGLE SHEET HEADERS
 # =============================================================================
 
 ACTIVE_HEADERS = [
+
     "Date Found",
+
     "Tender Key",
+
     "Tender ID / Ref No",
+
     "Portal Name",
+
     "State",
+
     "Organization / Dept",
+
     "Tender Title & Scope",
+
     "Category",
+
     "Estimated Value (INR)",
+
     "EMD (INR)",
+
     "EMD/MSME Exemption Evidence",
+
     "Submission Deadline",
+
     "Min Turnover Req",
+
     "Past Experience Requirement",
+
     "Entity Restriction",
+
     "JV/Consortium Allowed",
+
     "Key Compliance",
+
     "RFP / Tender Doc URLs",
+
     "Downloaded Files",
+
     "Pre-Bid Date",
+
     "Portal / Detail Link",
+
     "Qualification Status",
+
     "Remarks & Action Plan",
+
     "Evidence Quotes",
+
     "Extraction Status",
+
+    "Gemini Model Used",
 ]
 
 
 PORTAL_HEADERS = [
+
     "Portal",
+
     "Category",
+
     "State",
+
     "URL",
+
     "Active",
+
     "Last Crawl",
+
     "Tender Count",
+
     "Crawler Status",
+
     "Crawler Message",
+
     "Crawl Priority",
 ]
 
 
 # =============================================================================
-# 14. GOOGLE SHEET CONNECTION
+# 17. GOOGLE SHEET CONNECTION
 # =============================================================================
 
 def get_gspread_client():
 
     scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+
+        "https://www.googleapis.com/"
+        "auth/spreadsheets",
+
+        "https://www.googleapis.com/"
+        "auth/drive",
     ]
 
 
     credentials = (
+
         service_account
         .Credentials
         .from_service_account_file(
+
             SERVICE_ACCOUNT_FILE,
-            scopes=scopes
+
+            scopes=
+                scopes
         )
     )
 
 
-    return gspread.authorize(
-        credentials
+    return (
+        gspread.authorize(
+            credentials
+        )
     )
 
 
 def ensure_worksheet(
+
     spreadsheet,
+
     name,
-    rows=2000,
-    cols=30
+
+    rows=5000,
+
+    cols=35
 ):
 
     try:
 
-        return spreadsheet.worksheet(
-            name
+        return (
+            spreadsheet.worksheet(
+                name
+            )
         )
+
 
     except gspread.WorksheetNotFound:
 
-        return spreadsheet.add_worksheet(
-            title=name,
-            rows=rows,
-            cols=cols
+        return (
+            spreadsheet.add_worksheet(
+
+                title=
+                    name,
+
+                rows=
+                    rows,
+
+                cols=
+                    cols
+            )
         )
 
 
@@ -2941,43 +4509,66 @@ def existing_tender_keys(
 
 
     if not values:
-        return set()
+
+        return (
+            set()
+        )
 
 
-    header = values[
-        0
-    ]
+    headers = (
+        values[0]
+    )
 
 
     try:
 
-        index = header.index(
-            "Tender Key"
+        key_column = (
+            headers.index(
+                "Tender Key"
+            )
         )
+
 
     except ValueError:
 
-        return set()
+        return (
+            set()
+        )
 
 
     return {
-        row[index]
+
+        row[
+            key_column
+        ]
+
         for row
         in values[1:]
+
         if (
-            len(row) > index
-            and row[index]
+
+            len(
+                row
+            )
+            > key_column
+
+            and row[
+                key_column
+            ]
         )
     }
 
 
 # =============================================================================
-# 15. PORTAL STATUS SYNC
+# 18. PORTAL DIRECTORY
 # =============================================================================
 
 def sync_portal_directory(
+
     sheet,
+
     portals,
+
     health
 ):
 
@@ -2994,10 +4585,15 @@ def sync_portal_directory(
 
 
         rows.append([
+
             portal.portal,
+
             portal.category,
+
             portal.state,
+
             portal.url,
+
             portal.active,
 
             (
@@ -3032,22 +4628,28 @@ def sync_portal_directory(
 
 
     sheet.update(
-        values=rows,
+
+        values=
+            rows,
+
         range_name=
             f"A1:J{len(rows)}"
     )
 
 
 # =============================================================================
-# 16. PROCESS TENDER
+# 19. PROCESS ONE TENDER
 # =============================================================================
 
 def process_candidate(
+
     candidate,
+
     document_manager
 ):
 
     document_urls = (
+
         document_manager
         .discover_from_detail_page(
             candidate
@@ -3055,21 +4657,34 @@ def process_candidate(
     )
 
 
-    documents = [
-        document_manager
-        .download_and_extract(
-            url,
-            candidate.stable_key()
+    documents = []
+
+
+    for document_url in (
+        document_urls[:20]
+    ):
+
+        document = (
+            document_manager
+            .download_and_extract(
+
+                document_url,
+
+                candidate.stable_key()
+            )
         )
 
-        for url
-        in document_urls[:20]
-    ]
+
+        documents.append(
+            document
+        )
 
 
     evidence = (
         extract_eligibility(
+
             candidate,
+
             documents
         )
     )
@@ -3083,20 +4698,28 @@ def process_candidate(
 
 
     return (
+
         evidence,
+
         documents,
+
         decision
     )
 
 
 # =============================================================================
-# 17. MAIN PIPELINE
+# 20. MAIN PIPELINE
 # =============================================================================
 
 def run_pipeline():
 
-    started = (
+    started_at = (
         time.time()
+    )
+
+
+    log.info(
+        "=" * 70
     )
 
 
@@ -3106,9 +4729,21 @@ def run_pipeline():
     )
 
 
-    # -------------------------------------------------------------------------
-    # Load portals
-    # -------------------------------------------------------------------------
+    log.info(
+        "=" * 70
+    )
+
+
+    # =========================================================================
+    # Validate
+    # =========================================================================
+
+    validate_environment()
+
+
+    # =========================================================================
+    # Master source list
+    # =========================================================================
 
     portals = (
         load_master_portals()
@@ -3116,7 +4751,7 @@ def run_pipeline():
 
 
     log.info(
-        "Loaded %d active portals.",
+        "Loaded %d active tender portals.",
         len(
             portals
         )
@@ -3133,12 +4768,14 @@ def run_pipeline():
     health = {}
 
 
-    # -------------------------------------------------------------------------
-    # Generic / GePNIC portals
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Crawl non-GeM portals
+    # =========================================================================
 
     non_gem_portals = [
+
         portal
+
         for portal
         in portals
 
@@ -3150,14 +4787,19 @@ def run_pipeline():
 
 
     with ThreadPoolExecutor(
+
         max_workers=
             CRAWL_WORKERS
+
     ) as executor:
 
 
         futures = {
+
             executor.submit(
+
                 crawler.crawl,
+
                 portal
             ):
                 portal
@@ -3191,14 +4833,25 @@ def run_pipeline():
 
                 items = []
 
+
                 status = CrawlHealth(
-                    portal.portal,
-                    portal.url,
-                    "PARSER_FAILED",
-                    0,
-                    str(
-                        error
-                    )[:250]
+
+                    portal=
+                        portal.portal,
+
+                    url=
+                        portal.url,
+
+                    status=
+                        "PARSER_FAILED",
+
+                    discovered_count=
+                        0,
+
+                    message=
+                        str(
+                            error
+                        )[:250]
                 )
 
 
@@ -3212,54 +4865,77 @@ def run_pipeline():
             )
 
 
-    # -------------------------------------------------------------------------
-    # GeM
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Dedicated GeM crawler
+    # =========================================================================
 
-    gem_items, gem_health = (
+    gem_candidates, gem_health = (
         crawl_gem()
     )
 
 
     all_candidates.extend(
-        gem_items
+        gem_candidates
     )
 
 
     health[
         "Government e-Marketplace (GeM)"
-    ] = gem_health
+    ] = (
+        gem_health
+    )
 
 
-    # -------------------------------------------------------------------------
-    # Deduplicate
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Final bad-record filter + dedup
+    # =========================================================================
 
-    candidate_map = {
-        candidate.stable_key():
-            candidate
+    unique_map = {}
 
-        for candidate
-        in all_candidates
-    }
+
+    for candidate in all_candidates:
+
+        if not valid_tender_title(
+            candidate.title
+        ):
+
+            log.info(
+
+                "Ignoring invalid tender title: %s",
+
+                candidate.title
+            )
+
+
+            continue
+
+
+        key = (
+            candidate.stable_key()
+        )
+
+
+        unique_map[
+            key
+        ] = candidate
 
 
     candidates = list(
-        candidate_map.values()
+        unique_map.values()
     )
 
 
     log.info(
-        "Unique tender candidates: %d",
+        "Unique valid tender candidates discovered: %d",
         len(
             candidates
         )
     )
 
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Google Sheets
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     google_client = (
         get_gspread_client()
@@ -3275,39 +4951,53 @@ def run_pipeline():
 
     active_sheet = (
         ensure_worksheet(
+
             spreadsheet,
+
             "Active_Tenders",
-            rows=5000,
-            cols=30
+
+            rows=10000,
+
+            cols=35
         )
     )
 
 
     portal_sheet = (
         ensure_worksheet(
+
             spreadsheet,
+
             "Portal_Directory",
+
             rows=max(
+
                 500,
+
                 len(
                     portals
-                ) + 50
+                ) + 100
             ),
-            cols=12
+
+            cols=15
         )
     )
 
 
+    # A:Z = 26 columns.
+
     active_sheet.update(
+
         values=[
             ACTIVE_HEADERS
         ],
+
         range_name=
-            "A1:Y1"
+            "A1:Z1"
     )
 
 
-    existing = (
+    existing_keys = (
         existing_tender_keys(
             active_sheet
         )
@@ -3323,50 +5013,75 @@ def run_pipeline():
 
 
     # =========================================================================
-    # PROCESS NEW TENDERS
+    # Process tenders
     # =========================================================================
 
     for candidate in candidates:
 
-        key = (
+        tender_key = (
             candidate.stable_key()
         )
 
 
-        if key in existing:
+        if tender_key in (
+            existing_keys
+        ):
+
             continue
 
 
         log.info(
-            "Processing tender: %s",
-            candidate.tender_id
-            or key
+
+            "Processing tender: %s | %s",
+
+            (
+                candidate.tender_id
+                or tender_key
+            ),
+
+            candidate.title[:100]
         )
 
 
         evidence, documents, decision = (
+
             process_candidate(
+
                 candidate,
+
                 document_manager
             )
         )
 
 
+        # ---------------------------------------------------------------------
+        # Document paths and URLs
+        # ---------------------------------------------------------------------
+
         downloaded_files = [
+
             document.local_path
+
             for document
             in documents
+
             if document.local_path
         ]
 
 
         document_urls = list(
+
             dict.fromkeys(
+
                 candidate.discovered_doc_urls
+
                 + [
+
                     document.url
+
                     for document
                     in documents
+
                     if document.url
                 ]
             )
@@ -3374,116 +5089,140 @@ def run_pipeline():
 
 
         # ---------------------------------------------------------------------
-        # Experience text
+        # Experience
         # ---------------------------------------------------------------------
 
         experience_parts = []
 
 
-        if (
-            evidence.get(
-                "single_similar_work_required_inr"
-            )
-            is not None
-        ):
+        single = evidence.get(
+            "single_similar_work_required_inr"
+        )
+
+
+        two = evidence.get(
+            "two_similar_works_each_required_inr"
+        )
+
+
+        three = evidence.get(
+            "three_similar_works_each_required_inr"
+        )
+
+
+        if single is not None:
 
             experience_parts.append(
-                "1 work >= "
-                f"₹"
-                f"{evidence['single_similar_work_required_inr']:,.0f}"
+
+                f"1 work >= "
+                f"₹{single:,.0f}"
             )
 
 
-        if (
-            evidence.get(
-                "two_similar_works_each_required_inr"
-            )
-            is not None
-        ):
+        if two is not None:
 
             experience_parts.append(
-                "2 works each >= "
-                f"₹"
-                f"{evidence['two_similar_works_each_required_inr']:,.0f}"
+
+                f"2 works each >= "
+                f"₹{two:,.0f}"
             )
 
 
-        if (
-            evidence.get(
-                "three_similar_works_each_required_inr"
-            )
-            is not None
-        ):
+        if three is not None:
 
             experience_parts.append(
-                "3 works each >= "
-                f"₹"
-                f"{evidence['three_similar_works_each_required_inr']:,.0f}"
+
+                f"3 works each >= "
+                f"₹{three:,.0f}"
             )
 
 
-        experience = (
+        experience_text = (
+
             "; ".join(
                 experience_parts
             )
+
+            or evidence.get(
+                "experience_requirement_text"
+            )
+
             or
             "NOT VERIFIED / NOT STATED"
         )
 
 
         # ---------------------------------------------------------------------
-        # Compliance flags
+        # Special compliance
         # ---------------------------------------------------------------------
 
-        key_compliance = []
+        compliance_flags = []
 
 
-        if (
-            evidence.get(
-                "physical_submission_required"
-            )
-            is True
-        ):
+        if evidence.get(
+            "physical_submission_required"
+        ) is True:
 
-            key_compliance.append(
+            compliance_flags.append(
+
                 "Physical submission required"
             )
 
 
-        if (
-            evidence.get(
-                "qcbs_or_technical_pitch"
-            )
-            is True
-        ):
+        if evidence.get(
+            "qcbs_or_technical_pitch"
+        ) is True:
 
-            key_compliance.append(
+            compliance_flags.append(
+
                 "QCBS / technical pitch"
             )
 
 
-        if (
-            evidence.get(
-                "named_celebrity_or_artist_mandate"
-            )
-            is True
-        ):
+        if evidence.get(
+            "named_celebrity_or_artist_mandate"
+        ) is True:
 
-            key_compliance.append(
+            compliance_flags.append(
+
                 "Artist / celebrity mandate"
             )
 
 
-        remarks = (
-            f"{decision.reason} "
-            f"Action: "
-            f"{decision.action_plan}"
+        if evidence.get(
+            "non_core_scope"
+        ) is True:
+
+            compliance_flags.append(
+
+                "Non-core scope warning"
+            )
+
+
+        compliance_text = (
+
+            "; ".join(
+                compliance_flags
+            )
+
+            or
+            "No special compliance flag extracted"
         )
 
 
-        # ---------------------------------------------------------------------
-        # Sheet row
-        # ---------------------------------------------------------------------
+        remarks = (
+
+            decision.reason
+
+            + " Action: "
+
+            + decision.action_plan
+        )
+
+
+        # =========================================================================
+        # Google Sheet row
+        # =========================================================================
 
         new_rows.append([
 
@@ -3493,7 +5232,9 @@ def run_pipeline():
                 "%Y-%m-%d"
             ),
 
-            key,
+
+            tender_key,
+
 
             evidence.get(
                 "tender_reference"
@@ -3501,9 +5242,12 @@ def run_pipeline():
             or candidate.tender_id
             or "NOT VERIFIED",
 
+
             candidate.portal,
 
+
             candidate.state,
+
 
             evidence.get(
                 "organisation"
@@ -3511,36 +5255,45 @@ def run_pipeline():
             or candidate.organization
             or "NOT VERIFIED",
 
+
             evidence.get(
                 "scope_summary"
             )
             or candidate.title,
 
+
             candidate.category,
 
+
             (
                 evidence.get(
                     "estimated_value_inr"
                 )
+
                 if evidence.get(
                     "estimated_value_inr"
                 )
                 is not None
+
                 else
                 "NOT VERIFIED / NOT STATED"
             ),
+
 
             (
                 evidence.get(
                     "emd_inr"
                 )
+
                 if evidence.get(
                     "emd_inr"
                 )
                 is not None
+
                 else
                 "NOT VERIFIED / NOT STATED"
             ),
+
 
             evidence.get(
                 "emd_exemption_text"
@@ -3548,25 +5301,31 @@ def run_pipeline():
             or
             "NOT VERIFIED / NOT STATED",
 
+
             evidence.get(
                 "submission_deadline"
             )
             or candidate.deadline_raw
             or "NOT VERIFIED",
 
+
             (
                 evidence.get(
                     "average_turnover_required_inr"
                 )
+
                 if evidence.get(
                     "average_turnover_required_inr"
                 )
                 is not None
+
                 else
                 "NOT VERIFIED / NOT STATED"
             ),
 
-            experience,
+
+            experience_text,
+
 
             evidence.get(
                 "entity_type_restriction"
@@ -3574,39 +5333,42 @@ def run_pipeline():
             or
             "NOT VERIFIED / NOT STATED",
 
+
             (
                 "Yes"
+
                 if evidence.get(
                     "consortium_or_jv_allowed"
                 )
                 is True
 
                 else
+
                 "No"
+
                 if evidence.get(
                     "consortium_or_jv_allowed"
                 )
                 is False
 
                 else
+
                 "NOT VERIFIED / NOT STATED"
             ),
 
-            (
-                "; ".join(
-                    key_compliance
-                )
-                or
-                "No special flag extracted"
-            ),
+
+            compliance_text,
+
 
             "\n".join(
                 document_urls
             ),
 
+
             "\n".join(
                 downloaded_files
             ),
+
 
             evidence.get(
                 "pre_bid_date"
@@ -3614,14 +5376,19 @@ def run_pipeline():
             or
             "NOT VERIFIED / NOT STATED",
 
+
             candidate.detail_url
             or candidate.source_url,
 
+
             decision.status,
+
 
             remarks,
 
+
             "\n".join(
+
                 (
                     evidence.get(
                         "evidence_quotes"
@@ -3630,27 +5397,44 @@ def run_pipeline():
                 )[:10]
             ),
 
+
             evidence.get(
                 "extraction_status",
                 "UNKNOWN"
             ),
+
+
+            evidence.get(
+                "gemini_model_used",
+                ""
+            ),
         ])
 
 
-    # -------------------------------------------------------------------------
-    # Write new tenders
-    # -------------------------------------------------------------------------
+        existing_keys.add(
+            tender_key
+        )
+
+
+    # =========================================================================
+    # Batch append
+    # =========================================================================
 
     if new_rows:
 
         active_sheet.append_rows(
+
             new_rows,
-            value_input_option="RAW"
+
+            value_input_option=
+                "RAW"
         )
 
 
         log.info(
-            "Added %d new tenders.",
+
+            "Successfully added %d new tender records.",
+
             len(
                 new_rows
             )
@@ -3660,35 +5444,52 @@ def run_pipeline():
     else:
 
         log.info(
-            "No new tenders to add."
+            "No new tender records to append."
         )
 
 
-    # -------------------------------------------------------------------------
-    # Update portal health
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Portal status
+    # =========================================================================
 
     sync_portal_directory(
+
         portal_sheet,
+
         portals,
+
         health
     )
 
 
     elapsed = (
+
         time.time()
-        - started
+        - started_at
     )
 
 
     log.info(
-        "Completed in %.1f seconds.",
+        "=" * 70
+    )
+
+
+    log.info(
+
+        "Tender Intelligence Agent completed "
+        "in %.1f seconds.",
+
         elapsed
     )
 
 
+    log.info(
+        "=" * 70
+    )
+
+
 # =============================================================================
-# RUN
+# 21. RUN
 # =============================================================================
 
 if __name__ == "__main__":
