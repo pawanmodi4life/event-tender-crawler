@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-DISCOVERY-FIX-V5"
+CODE_VERSION = "2026-09-25-SERVICE-FILTER-V6"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -551,9 +551,37 @@ def keyword_hits(text):
 
 
 def infer_category(title):
+    """
+    Classify only the service family relevant to an event/experience agency.
+    Event management is intentionally treated as a SERVICE category.
+    """
     text = normalize_space(
         title or ""
     ).lower()
+
+    if contains_any_phrase(
+        text,
+        [
+            "event management",
+            "event management agency",
+            "event agency",
+            "event organiser",
+            "event organizer",
+            "event production",
+            "event execution",
+            "event services",
+            "event partner",
+            "annual day",
+            "foundation day",
+            "award ceremony",
+            "dealer meet",
+            "launch event",
+            "product launch",
+            "brand activation",
+            "experiential marketing",
+        ],
+    ):
+        return "Services - Event Management"
 
     if contains_any_phrase(
         text,
@@ -562,41 +590,17 @@ def infer_category(title):
             "exhibition pavilion",
             "stall design",
             "stall fabrication",
+            "stall construction",
             "pavilion design",
             "pavilion fabrication",
-            "expo",
-            "trade fair",
+            "pavilion construction",
+            "exhibition design",
+            "exhibition management",
+            "expo management",
+            "trade fair management",
         ],
     ):
-        return "Exhibition / Stall"
-
-    if (
-        (
-            contains_phrase(
-                text,
-                "empanelment",
-            )
-            or
-            contains_phrase(
-                text,
-                "empanel",
-            )
-        )
-        and
-        contains_any_phrase(
-            text,
-            [
-                "event",
-                "exhibition",
-                "advertising",
-                "creative",
-                "publicity",
-                "media",
-                "communication",
-            ],
-        )
-    ):
-        return "Empanelment"
+        return "Services - Exhibition / Stall"
 
     if contains_any_phrase(
         text,
@@ -604,67 +608,80 @@ def infer_category(title):
             "conference management",
             "organising conference",
             "organizing conference",
+            "organisation of conference",
+            "organization of conference",
             "conduct of conference",
+            "organising convention",
+            "organizing convention",
+            "convention management",
             "summit management",
-            "organising summit",
-            "organizing summit",
             "conclave management",
-            "organising conclave",
-            "organizing conclave",
+            "seminar management",
+            "organising seminar",
+            "organizing seminar",
         ],
     ):
-        return "Conference / Conclave"
+        return "Services - Conference / Convention"
 
     if contains_any_phrase(
         text,
         [
             "advertising agency",
             "creative agency",
-            "media campaign",
+            "communication agency",
             "publicity campaign",
             "outreach campaign",
             "iec campaign",
-            "communication agency",
+            "media campaign",
+            "social media agency",
+            "social media and communication agency",
             "pr agency",
         ],
     ):
-        return "Advertising / Creative / Outreach"
+        return "Services - Creative / Advertising / Outreach"
 
     if contains_any_phrase(
         text,
         [
-            "festival management",
+            "audio visual coverage",
+            "audio visual production",
+            "av production",
+            "photography",
+            "videography",
+            "stage setup",
+            "stage production",
+            "sound and light",
+            "event decoration",
+            "tentage for event",
+        ],
+    ):
+        return "Services - AV / Production"
+
+    if (
+        contains_phrase(
+            text,
+            "empanelment",
+        )
+        or
+        contains_phrase(
+            text,
+            "empanel",
+        )
+    ):
+        return "Services - Empanelment"
+
+    if contains_any_phrase(
+        text,
+        [
             "mela management",
-            "organising mela",
-            "organizing mela",
+            "festival management",
             "cultural event",
             "cultural programme",
         ],
     ):
-        return "Festival / Mela / Cultural"
+        return "Services - Festival / Mela / Cultural"
 
-    if contains_any_phrase(
-        text,
-        [
-            "event management",
-            "event agency",
-            "event production",
-            "event execution",
-            "corporate event",
-            "annual day",
-            "foundation day",
-            "award ceremony",
-            "brand activation",
-            "experiential marketing",
-            "roadshow",
-            "dealer meet",
-            "launch event",
-            "product launch",
-        ],
-    ):
-        return "Event / Experiential"
-
-    return "Unclassified"
+    return "Services - Other Event Related"
 
 
 def safe_urljoin(base, href):
@@ -981,6 +998,403 @@ def is_relevant_event_title(title):
         and
         has_service_action
     )
+
+
+# =============================================================================
+# EVENT-SERVICE QUALITY FILTER
+# =============================================================================
+
+SERVICE_GOODS_EXCLUSIONS = [
+    "supply of audio visual",
+    "procurement of audio visual",
+    "audio visual equipment",
+    "audio visual equipments",
+    "audio visual system",
+    "av equipment",
+    "video conferencing system",
+    "conference system and accessories",
+    "interactive display",
+    "display and video conferencing",
+    "supply of bags",
+    "supply of airfryer",
+    "supply of chairs",
+    "supply of gifts",
+    "supply of mementos",
+    "supply of prizes",
+    "procurement of prizes",
+    "procurement of gifts",
+    "procurement of banners",
+    "procurement of shawls",
+    "batteries",
+    "ups",
+    "diesel generator",
+    "dg set",
+    "fire alarm",
+    "sprinkler",
+    "fire hydrant",
+]
+
+SERVICE_RIGHTS_EXCLUSIONS = [
+    "temporary allotment of open space",
+    "allotment of open space",
+    "allotment of space",
+    "licensing of space",
+    "licence of space",
+    "license of space",
+    "joyrides",
+    "meenabazar",
+    "parking rights",
+    "kiosk allotment",
+]
+
+SERVICE_INFRA_EXCLUSIONS = [
+    "conference hall",
+    "revamping of conference hall",
+    "interior works",
+    "civil works",
+    "construction of",
+    "maintenance and repair",
+    "annual maintenance",
+    "day-to-day maintenance",
+    "horticulture works",
+    "road works",
+]
+
+NON_SPECIFIC_TENDER_TITLES = [
+    "latest advertising agency tenders",
+    "latest audio visual tenders",
+    "latest audio visual accessory tenders",
+    "latest audio visual equipment tenders",
+    "latest audio visual instrument tenders",
+    "audio visual equipments tenders from india",
+    "advertising, film & media campaign govt. tenders",
+    "advertising film and media campaign tenders",
+    "event management tenders",
+    "india expo centre & mart tenders",
+    "india international convention and exhibition centre",
+]
+
+HIGH_CONFIDENCE_SERVICE_PHRASES = [
+    "event management",
+    "event management agency",
+    "event agency",
+    "event organiser",
+    "event organizer",
+    "event production",
+    "event execution",
+    "event services",
+    "event partner",
+    "empanelment of event",
+    "empanelment of event management",
+    "hiring of event",
+    "selection of event management",
+    "organising all the events",
+    "organizing all the events",
+
+    "exhibition stall",
+    "exhibition pavilion",
+    "stall design",
+    "stall fabrication",
+    "stall construction",
+    "pavilion design",
+    "pavilion fabrication",
+    "pavilion construction",
+    "exhibition management",
+    "expo management",
+    "trade fair management",
+
+    "conference management",
+    "organising conference",
+    "organizing conference",
+    "organisation of conference",
+    "organization of conference",
+    "organising convention",
+    "organizing convention",
+    "convention management",
+    "summit management",
+    "conclave management",
+    "seminar management",
+    "organising seminar",
+    "organizing seminar",
+
+    "advertising agency",
+    "creative agency",
+    "communication agency",
+    "social media agency",
+    "social media and communication agency",
+    "publicity campaign",
+    "outreach campaign",
+    "iec campaign",
+    "media campaign",
+    "pr agency",
+
+    "audio visual coverage",
+    "audio visual production",
+    "photography videography",
+    "photography and videography",
+    "stage production",
+    "stage setup",
+    "event decoration",
+    "brand activation",
+    "experiential marketing",
+
+    "mela management",
+    "festival management",
+    "cultural event management",
+]
+
+def _extract_explicit_dates(text):
+    """
+    Extract common Indian tender dates from title/deadline text.
+    Returns timezone-aware date objects where parsing is reliable.
+    """
+    text = normalize_space(
+        text or ""
+    )
+
+    output = []
+
+    numeric_patterns = [
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})\b",
+        r"\b(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b",
+    ]
+
+    for match in re.finditer(
+        numeric_patterns[0],
+        text,
+    ):
+        try:
+            output.append(
+                dt.date(
+                    int(match.group(3)),
+                    int(match.group(2)),
+                    int(match.group(1)),
+                )
+            )
+        except ValueError:
+            pass
+
+    for match in re.finditer(
+        numeric_patterns[1],
+        text,
+    ):
+        try:
+            output.append(
+                dt.date(
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                )
+            )
+        except ValueError:
+            pass
+
+    month_map = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+
+    for match in re.finditer(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"[,\s]+(20\d{2})\b",
+        text,
+        flags=re.I,
+    ):
+        try:
+            month = month_map[
+                match.group(2).lower()
+            ]
+            output.append(
+                dt.date(
+                    int(match.group(3)),
+                    month,
+                    int(match.group(1)),
+                )
+            )
+        except (ValueError, KeyError):
+            pass
+
+    return output
+
+
+def is_expired_candidate(candidate):
+    """
+    Reject clearly expired/historical tenders.
+    Unknown dates are not rejected.
+    """
+    today = dt.datetime.now(
+        tz=IST
+    ).date()
+
+    title = normalize_space(
+        candidate.title or ""
+    )
+
+    deadline_text = normalize_space(
+        candidate.deadline_raw or ""
+    )
+
+    combined = (
+        title
+        + " "
+        + deadline_text
+    )
+
+    dates = _extract_explicit_dates(
+        combined
+    )
+
+    # If title explicitly says Last Date/closing/deadline and that date is old,
+    # this is safe to reject.
+    if re.search(
+        r"(last\s*date|closing\s*date|submission\s*deadline|bid\s*end\s*date)",
+        combined,
+        flags=re.I,
+    ):
+        if dates and max(dates) < today:
+            return True
+
+    # Reject clearly historic archive entries from previous years when no
+    # current-year reference is present.
+    current_year = today.year
+    years = {
+        int(year)
+        for year in re.findall(
+            r"\b(20\d{2})\b",
+            title,
+        )
+    }
+
+    if (
+        years
+        and
+        max(years) < current_year
+    ):
+        return True
+
+    tender_id = normalize_space(
+        candidate.tender_id or ""
+    )
+
+    id_years = {
+        int(year)
+        for year in re.findall(
+            r"\b(20\d{2})\b",
+            tender_id,
+        )
+    }
+
+    if (
+        id_years
+        and
+        max(id_years) < current_year - 1
+    ):
+        return True
+
+    return False
+
+
+def is_event_service_candidate(candidate):
+    """
+    Final business-fit filter for Soul Events and Consultancy.
+
+    Keep procurement of EVENT/EXHIBITION/CREATIVE/AV SERVICES.
+    Reject goods/equipment purchases, civil/interior works, space allotments,
+    archive/category pages and clearly expired historical tenders.
+    """
+    title = normalize_space(
+        candidate.title or ""
+    ).lower()
+
+    detail_url = (
+        candidate.detail_url
+        or candidate.source_url
+        or ""
+    ).lower()
+
+    if not title:
+        return False, "blank title"
+
+    if any(
+        phrase in title
+        for phrase in NON_SPECIFIC_TENDER_TITLES
+    ):
+        return False, "category/listing page, not a specific tender"
+
+    if any(
+        token in detail_url
+        for token in [
+            "/archive",
+            "/archived",
+            "archive-tenders",
+            "archived-tenders",
+        ]
+    ):
+        return False, "archive/historical tender URL"
+
+    if contains_any_phrase(
+        title,
+        SERVICE_RIGHTS_EXCLUSIONS,
+    ):
+        return False, "space/allotment/rights opportunity, not event-management service"
+
+    if contains_any_phrase(
+        title,
+        SERVICE_INFRA_EXCLUSIONS,
+    ):
+        return False, "civil/interior/maintenance scope, not event-management service"
+
+    high_confidence_service = contains_any_phrase(
+        title,
+        HIGH_CONFIDENCE_SERVICE_PHRASES,
+    )
+
+    if contains_any_phrase(
+        title,
+        SERVICE_GOODS_EXCLUSIONS,
+    ) and not high_confidence_service:
+        return False, "goods/equipment procurement, not service"
+
+    # Generic supply/procurement/SITC scopes are rejected unless the same
+    # title explicitly contains a high-confidence event-service phrase.
+    if (
+        contains_any_phrase(
+            title,
+            [
+                "supply of",
+                "procurement of",
+                "purchase of",
+                "sitc of",
+                "supply installation testing commissioning",
+                "supply, installation, testing and commissioning",
+            ],
+        )
+        and
+        not high_confidence_service
+    ):
+        return False, "supply/procurement scope without event-service mandate"
+
+    if is_expired_candidate(
+        candidate
+    ):
+        return False, "expired/historical tender"
+
+    if not high_confidence_service:
+        return False, "event word present but no clear service mandate"
+
+    return True, "event/exhibition/creative service procurement"
 
 
 PROCUREMENT_STRONG_TERMS = [
@@ -5245,10 +5659,16 @@ def clean_active_tenders_sheet(sheet):
             ),
         )
 
+        service_ok, _service_reason = is_event_service_candidate(
+            candidate
+        )
+
         keep = (
             is_relevant_event_title(
                 title
             )
+            and
+            service_ok
             and
             is_procurement_candidate(
                 candidate
@@ -5670,6 +6090,10 @@ def filter_event_candidates(
     filtered = []
     rejected = []
 
+    # Cross-source dedupe: prefer one specific opportunity instead of the same
+    # tender repeated from official + aggregator/category pages.
+    seen_business_keys = set()
+
     for candidate in candidates:
         if not valid_tender_title(
             candidate.title
@@ -5686,6 +6110,22 @@ def filter_event_candidates(
             log.info(
                 "Skipping non-event tender: %s",
                 candidate.title[:150],
+            )
+            continue
+
+        service_ok, service_reason = is_event_service_candidate(
+            candidate
+        )
+
+        if not service_ok:
+            rejected.append(
+                candidate
+            )
+
+            log.info(
+                "Skipping non-service/random tender: %s | %s",
+                candidate.title[:150],
+                service_reason,
             )
             continue
 
@@ -5710,12 +6150,62 @@ def filter_event_candidates(
             )
             continue
 
+        # Reclassify after the strict service filter.
+        candidate.category = infer_category(
+            candidate.title
+        )
+
+        ref = normalize_space(
+            candidate.tender_id or ""
+        ).lower()
+
+        if (
+            ref
+            and
+            ref not in {
+                "not verified",
+                "not stated",
+            }
+        ):
+            business_key = (
+                "REF:"
+                + re.sub(
+                    r"\s+",
+                    "",
+                    ref,
+                )
+            )
+        else:
+            normalized_title = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                normalize_space(
+                    candidate.title
+                ).lower(),
+            ).strip()
+
+            business_key = (
+                "TITLE:"
+                + normalized_title[:220]
+            )
+
+        if business_key in seen_business_keys:
+            log.info(
+                "Skipping duplicate tender across sources: %s",
+                candidate.title[:150],
+            )
+            continue
+
+        seen_business_keys.add(
+            business_key
+        )
+
         filtered.append(
             candidate
         )
 
     log.info(
-        "Event + procurement filter: %d kept / %d rejected",
+        "Strict SERVICE filter: %d kept / %d rejected",
         len(filtered),
         len(rejected),
     )
@@ -5794,6 +6284,8 @@ def validate_deployed_build():
         "clean_active_tenders_sheet",
         "sync_portal_directory",
         "crawl_gem",
+        "is_event_service_candidate",
+        "is_expired_candidate",
     ]
 
     missing = [
@@ -6011,6 +6503,22 @@ def run_pipeline():
                 candidate.title[:200],
             )
             continue
+
+        service_ok, service_reason = is_event_service_candidate(
+            candidate
+        )
+
+        if not service_ok:
+            log.warning(
+                "FINAL WRITE BLOCKED - non-service/random scope: %s | %s",
+                candidate.title[:200],
+                service_reason,
+            )
+            continue
+
+        candidate.category = infer_category(
+            candidate.title
+        )
 
         procurement_score, procurement_reasons = procurement_intent_score(
             candidate
