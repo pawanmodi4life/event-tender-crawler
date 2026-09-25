@@ -9,6 +9,8 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
+CODE_VERSION = "2026-09-25-STRUCTURAL-FIX-V3"
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -917,6 +919,497 @@ def is_relevant_event_title(title):
         return True
 
     return False
+
+
+
+PROCUREMENT_STRONG_TERMS = [
+    "request for proposal",
+    "request for quotation",
+    "expression of interest",
+    "notice inviting tender",
+    "notice inviting bid",
+    "tender",
+    "bid",
+    "rfp",
+    "rfq",
+    "eoi",
+    "nit",
+    "empanelment",
+    "selection of agency",
+    "selection of event",
+    "appointment of agency",
+    "hiring of agency",
+    "engagement of agency",
+]
+
+NON_PROCUREMENT_CONTENT_TERMS = [
+    "press release",
+    "news update",
+    "news updates",
+    "media release",
+    "speech",
+    "statement by",
+    "participated in",
+    "participates in",
+    "inaugurated",
+    "celebrated",
+    "celebrates",
+    "gallery",
+    "photo gallery",
+    "annual report",
+    "investor",
+    "brochure",
+    "success story",
+]
+
+NON_PROCUREMENT_URL_TERMS = [
+    "/news/",
+    "/news_",
+    "/news-",
+    "/news_marquee/",
+    "/press-release",
+    "/press_release",
+    "/media/",
+    "/gallery/",
+    "/blog/",
+    "/events/",
+    "/speech",
+    "/annual-report",
+    "/investor",
+    "/industry-projects/",
+]
+
+
+def procurement_intent_score(candidate):
+    """
+    Score whether a discovered item is actually a procurement opportunity,
+    rather than a news/article/content page that merely mentions an event.
+
+    A score >= 3 is considered procurement-intent-positive.
+    """
+
+    title = normalize_space(
+        candidate.title or ""
+    ).lower()
+
+    tender_id = normalize_space(
+        candidate.tender_id or ""
+    )
+
+    detail_url = (
+        candidate.detail_url
+        or candidate.source_url
+        or ""
+    ).lower()
+
+    source_url = (
+        candidate.source_url
+        or ""
+    ).lower()
+
+    score = 0
+    reasons = []
+
+    # Strongest signal: a recognizable tender / bid reference.
+    if tender_id and tender_id.upper() not in {
+        "NOT VERIFIED",
+        "NOT STATED",
+    }:
+        if re.search(
+            r"(?:GEM/\d{4}/B/\d+|(?:RFP|RFQ|EOI|NIT|TENDER|BID)[\s:/_-]*[A-Za-z0-9._/-]{2,}|\d{4}_[A-Za-z0-9_-]+_\d+_\d+)",
+            tender_id,
+            flags=re.I,
+        ):
+            score += 4
+            reasons.append("recognizable tender reference")
+        elif len(tender_id) >= 5:
+            score += 2
+            reasons.append("non-empty tender reference")
+
+    if any(
+        term in title
+        for term in PROCUREMENT_STRONG_TERMS
+    ):
+        score += 3
+        reasons.append("procurement wording in title")
+
+    if any(
+        token in detail_url
+        for token in [
+            "showbiddocument",
+            "/tender/",
+            "/tenders/",
+            "tenderid",
+            "bidplus",
+            "eprocure",
+            "etender",
+            "e-tender",
+            "/rfp/",
+            "/eoi/",
+            "/nit/",
+            "procurement",
+        ]
+    ):
+        score += 2
+        reasons.append("procurement-style detail URL")
+
+    if any(
+        token in source_url
+        for token in [
+            "eprocure",
+            "etender",
+            "tenders.gov",
+            "gem.gov.in",
+            "bidplus",
+            "tendernews",
+            "tendertiger",
+            "indiantenders",
+            "tenderdetail",
+            "tendershark",
+        ]
+    ):
+        score += 1
+        reasons.append("known tender portal context")
+
+    if is_relevant_event_title(
+        candidate.title
+    ):
+        score += 1
+        reasons.append("event-service scope")
+
+    if any(
+        term in title
+        for term in NON_PROCUREMENT_CONTENT_TERMS
+    ):
+        score -= 5
+        reasons.append("news/content wording")
+
+    if any(
+        term in detail_url
+        for term in NON_PROCUREMENT_URL_TERMS
+    ):
+        score -= 5
+        reasons.append("news/content URL")
+
+    # Category/index pages are not specific tender opportunities.
+    if any(
+        term in detail_url
+        for term in [
+            "/industry-projects/",
+            "/category/",
+            "/categories/",
+            "/search",
+        ]
+    ) and not tender_id:
+        score -= 3
+        reasons.append("category/search page without tender reference")
+
+    return score, reasons
+
+
+def is_procurement_candidate(candidate):
+    score, _ = procurement_intent_score(
+        candidate
+    )
+    return score >= 3
+
+
+def _safe_number_from_text(value):
+    """
+    Parse a monetary value into INR when possible.
+    Supports explicit rupees as well as lakh/crore wording.
+    """
+    if value is None:
+        return None
+
+    text_value = normalize_space(
+        str(value)
+    ).lower()
+
+    if not text_value:
+        return None
+
+    match = re.search(
+        r"(?:₹|rs\.?|inr)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(crore|cr|lakh|lac|lakhs|lacs)?",
+        text_value,
+        flags=re.I,
+    )
+
+    if not match:
+        return None
+
+    try:
+        number = float(
+            match.group(1).replace(
+                ",",
+                "",
+            )
+        )
+    except ValueError:
+        return None
+
+    unit = (
+        match.group(2)
+        or ""
+    ).lower()
+
+    if unit in {
+        "crore",
+        "cr",
+    }:
+        number *= 10_000_000
+
+    elif unit in {
+        "lakh",
+        "lac",
+        "lakhs",
+        "lacs",
+    }:
+        number *= 100_000
+
+    return int(
+        round(number)
+    )
+
+
+def _extract_labeled_value(text_value, labels, max_chars=120):
+    if not text_value:
+        return ""
+
+    for label in labels:
+        pattern = (
+            rf"(?:{label})\s*"
+            rf"(?:[:\-–]\s*)?"
+            rf"([^\n\r]{{1,{max_chars}}})"
+        )
+
+        match = re.search(
+            pattern,
+            text_value,
+            flags=re.I,
+        )
+
+        if match:
+            return normalize_space(
+                match.group(1)
+            )
+
+    return ""
+
+
+def extract_deterministic_metadata(
+    candidate,
+    documents,
+):
+    """
+    Extract basic tender metadata without AI.
+
+    These fields should not depend on OpenAI availability:
+    tender ref, organisation, deadlines, EMD, estimated value,
+    turnover hint and pre-bid date.
+    """
+
+    chunks = [
+        candidate.title or "",
+        candidate.tender_id or "",
+        candidate.deadline_raw or "",
+        candidate.estimated_value_raw or "",
+    ]
+
+    for document in documents:
+        if document.text:
+            chunks.append(
+                document.text[:250_000]
+            )
+
+    combined = "\n".join(
+        chunks
+    )
+
+    refs = extract_ref_candidates(
+        combined
+    )
+
+    tender_reference = (
+        candidate.tender_id
+        if (
+            candidate.tender_id
+            and
+            candidate.tender_id.upper()
+            not in {
+                "NOT VERIFIED",
+                "NOT STATED",
+            }
+        )
+        else (
+            refs[0]
+            if refs
+            else None
+        )
+    )
+
+    deadline = _extract_labeled_value(
+        combined,
+        [
+            r"bid\s*end\s*date(?:\s*/\s*time)?",
+            r"bid\s*submission\s*end\s*date(?:\s*/\s*time)?",
+            r"last\s*date(?:\s*and\s*time)?\s*of\s*submission",
+            r"last\s*date\s*for\s*submission",
+            r"submission\s*deadline",
+            r"closing\s*date(?:\s*/\s*time)?",
+            r"tender\s*closing\s*date",
+        ],
+        max_chars=80,
+    ) or (
+        candidate.deadline_raw
+        if (
+            candidate.deadline_raw
+            and candidate.deadline_raw != "NOT VERIFIED"
+        )
+        else ""
+    )
+
+    pre_bid = _extract_labeled_value(
+        combined,
+        [
+            r"pre[\s-]*bid\s*(?:meeting|conference)?\s*(?:date)?",
+            r"pre[\s-]*bid\s*date",
+        ],
+        max_chars=80,
+    )
+
+    emd_text = _extract_labeled_value(
+        combined,
+        [
+            r"emd",
+            r"earnest\s*money\s*deposit",
+            r"bid\s*security",
+        ],
+        max_chars=100,
+    )
+
+    estimated_text = _extract_labeled_value(
+        combined,
+        [
+            r"estimated\s*(?:bid|tender|contract)?\s*value",
+            r"estimated\s*cost",
+            r"tender\s*value",
+            r"bid\s*value",
+            r"contract\s*value",
+        ],
+        max_chars=100,
+    ) or (
+        candidate.estimated_value_raw
+        if (
+            candidate.estimated_value_raw
+            and candidate.estimated_value_raw != "NOT VERIFIED"
+        )
+        else ""
+    )
+
+    turnover_text = _extract_labeled_value(
+        combined,
+        [
+            r"average\s*annual\s*turnover",
+            r"minimum\s*annual\s*turnover",
+            r"annual\s*turnover",
+            r"minimum\s*turnover",
+        ],
+        max_chars=140,
+    )
+
+    organisation = _extract_labeled_value(
+        combined,
+        [
+            r"organisation\s*name",
+            r"organization\s*name",
+            r"buyer\s*organisation",
+            r"buyer\s*organization",
+            r"department\s*name",
+            r"ministry\s*/\s*state\s*name",
+        ],
+        max_chars=120,
+    )
+
+    if not organisation:
+        organisation = (
+            candidate.organization
+            or ""
+        )
+
+    return {
+        "tender_reference": tender_reference,
+        "organisation": organisation or None,
+        "submission_deadline": deadline or None,
+        "pre_bid_date": pre_bid or None,
+        "emd_inr": _safe_number_from_text(
+            emd_text
+        ),
+        "estimated_value_inr": _safe_number_from_text(
+            estimated_text
+        ),
+        "average_turnover_required_inr": _safe_number_from_text(
+            turnover_text
+        ),
+        "deterministic_emd_text": emd_text or None,
+        "deterministic_estimated_value_text": estimated_text or None,
+        "deterministic_turnover_text": turnover_text or None,
+    }
+
+
+def merge_deterministic_metadata(
+    candidate,
+    documents,
+    evidence,
+):
+    deterministic = extract_deterministic_metadata(
+        candidate,
+        documents,
+    )
+
+    merged = dict(
+        evidence or {}
+    )
+
+    # Only fill blanks; never overwrite an AI-extracted explicit value.
+    for field_name in [
+        "tender_reference",
+        "organisation",
+        "submission_deadline",
+        "pre_bid_date",
+        "emd_inr",
+        "estimated_value_inr",
+        "average_turnover_required_inr",
+    ]:
+        if (
+            merged.get(
+                field_name
+            )
+            in (
+                None,
+                "",
+                "NOT VERIFIED",
+                "NOT VERIFIED / NOT STATED",
+            )
+        ):
+            value = deterministic.get(
+                field_name
+            )
+
+            if value not in (
+                None,
+                "",
+            ):
+                merged[
+                    field_name
+                ] = value
+
+    merged[
+        "deterministic_metadata"
+    ] = deterministic
+
+    return merged
+
 
 
 def is_relevant_event_tender(candidate):
@@ -2434,17 +2927,16 @@ class TenderCrawler:
 
 def crawl_gem():
     """
-    Crawl the standard public GeM bid listing:
-        https://bidplus.gem.gov.in/all-bids
+    Resilient GeM crawler.
 
-    This is intentionally separate from the GTE-only surface:
-        https://bidplus-global.gem.gov.in/
+    Primary:
+      https://bidplus.gem.gov.in/all-bids
 
-    Strategy:
-    - search event-related keywords
-    - parse rendered text AND HTML
-    - capture real links instead of fabricating document paths
-    - follow Next pagination when available
+    Fallback:
+      https://bidplus-global.gem.gov.in/
+
+    If the GitHub runner cannot reach the primary endpoint, the crawler
+    automatically falls back to the GTE surface.
     """
 
     if sync_playwright is None:
@@ -2483,9 +2975,12 @@ def crawl_gem():
         "Stall Fabrication",
     ]
 
-    results = []
+    def crawl_surface(
+        target_url,
+        surface_name,
+    ):
+        collected = []
 
-    try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -2512,36 +3007,30 @@ def crawl_gem():
             page = context.new_page()
 
             page.goto(
-                GEM_LISTING_URL,
+                target_url,
                 timeout=60000,
                 wait_until="domcontentloaded",
             )
-
-            page.wait_for_timeout(
-                4000
-            )
+            page.wait_for_timeout(4000)
 
             search_ui_found = False
 
             for term in search_terms:
-                # Re-resolve the input each search because dynamic UIs can recreate DOM.
                 search_input = None
 
-                selectors = [
+                for selector in [
                     'input[placeholder*="Enter Keyword" i]',
                     'input[placeholder*="Enter Keywords" i]',
                     'input[placeholder*="Keyword" i]',
                     'input[placeholder*="Search" i]',
                     'input[type="search"]',
                     'input#search_by',
-                ]
-
-                for selector in selectors:
-                    locator = page.locator(
-                        selector
-                    ).first
-
+                ]:
                     try:
+                        locator = page.locator(
+                            selector
+                        ).first
+
                         if (
                             locator.count()
                             and
@@ -2555,34 +3044,24 @@ def crawl_gem():
 
                 if search_input is None:
                     log.warning(
-                        "GeM search field not found for term: %s",
+                        "GeM %s search input not found for: %s",
+                        surface_name,
                         term,
                     )
                     continue
 
                 try:
                     search_input.fill("")
-                    search_input.fill(
-                        term
-                    )
+                    search_input.fill(term)
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(3000)
 
-                    # Try Enter first.
-                    page.keyboard.press(
-                        "Enter"
-                    )
-
-                    page.wait_for_timeout(
-                        3500
-                    )
-
-                    # If the page exposes a Search button, click it too.
-                    search_buttons = [
+                    # Some GeM versions require a Search button click.
+                    for selector in [
                         'button:has-text("Search")',
                         'input[type="submit"][value*="Search" i]',
                         'button[aria-label*="Search" i]',
-                    ]
-
-                    for selector in search_buttons:
+                    ]:
                         try:
                             button = page.locator(
                                 selector
@@ -2597,7 +3076,7 @@ def crawl_gem():
                                     timeout=5000
                                 )
                                 page.wait_for_timeout(
-                                    2500
+                                    2000
                                 )
                                 break
                         except Exception:
@@ -2610,14 +3089,9 @@ def crawl_gem():
                         1,
                         MAX_GEM_PAGES_PER_SEARCH + 1,
                     ):
-                        page.wait_for_timeout(
-                            1500
-                        )
-
                         body_text = page.locator(
                             "body"
                         ).inner_text()
-
                         html = page.content()
 
                         bid_numbers = extract_gem_bid_numbers(
@@ -2625,11 +3099,9 @@ def crawl_gem():
                             html,
                         )
 
-                        # Collect all real rendered links.
                         anchors = page.locator(
                             "a[href]"
                         )
-
                         hrefs = []
 
                         for index in range(
@@ -2666,7 +3138,7 @@ def crawl_gem():
                                 if (
                                     "showbiddocument" in combined
                                     or
-                                    "bidplus.gem.gov.in" in combined
+                                    "bidplus" in combined
                                     or
                                     "gem/" in combined
                                 ):
@@ -2676,29 +3148,21 @@ def crawl_gem():
                                             absolute,
                                         )
                                     )
-
                             except Exception:
                                 continue
 
-                        # Also extract bid numbers from link labels.
-                        link_text_blob = "\n".join(
-                            label
-                            for label, _ in hrefs
-                            if label
-                        )
-
                         bid_numbers = extract_gem_bid_numbers(
+                            "\n".join(bid_numbers),
                             "\n".join(
-                                bid_numbers
+                                label
+                                for label, _ in hrefs
+                                if label
                             ),
-                            link_text_blob,
                         )
 
                         signature = hashlib.sha256(
                             (
-                                "|".join(
-                                    bid_numbers
-                                )
+                                "|".join(bid_numbers)
                                 + "|"
                                 + page.url
                             ).encode(
@@ -2707,10 +3171,6 @@ def crawl_gem():
                         ).hexdigest()
 
                         if signature in seen_page_signatures:
-                            log.info(
-                                "GeM | %s | repeated page detected; stopping.",
-                                term,
-                            )
                             break
 
                         seen_page_signatures.add(
@@ -2732,6 +3192,7 @@ def crawl_gem():
                             )[-1]
 
                             matching_urls = []
+                            visible_title = ""
 
                             for label, href in hrefs:
                                 combined = (
@@ -2747,10 +3208,32 @@ def crawl_gem():
                                         href
                                     )
 
+                                    if (
+                                        label
+                                        and
+                                        len(label)
+                                        >
+                                        len(visible_title)
+                                        and
+                                        label.lower()
+                                        !=
+                                        bid_no.lower()
+                                    ):
+                                        visible_title = label
+
                             matching_urls = list(
                                 dict.fromkeys(
                                     matching_urls
                                 )
+                            )
+
+                            title = (
+                                visible_title
+                                if valid_tender_title(
+                                    visible_title
+                                )
+                                else
+                                f"{term} | {bid_no}"
                             )
 
                             real_url = (
@@ -2759,45 +3242,14 @@ def crawl_gem():
                                 else page.url
                             )
 
-                            # Try to obtain a richer visible title from an anchor/card.
-                            visible_title = ""
-
-                            for label, href in hrefs:
-                                combined = (
-                                    f"{label} {href}"
-                                ).lower()
-
-                                if (
-                                    bid_no.lower() in combined
-                                    or
-                                    numeric_bid in combined
-                                ):
-                                    if (
-                                        label
-                                        and
-                                        len(label) > len(visible_title)
-                                        and
-                                        label.lower()
-                                        != bid_no.lower()
-                                    ):
-                                        visible_title = label
-
-                            title = (
-                                visible_title
-                                if valid_tender_title(
-                                    visible_title
-                                )
-                                else f"{term} | {bid_no}"
-                            )
-
-                            results.append(
+                            collected.append(
                                 TenderCandidate(
                                     portal=(
                                         "Government "
                                         "e-Marketplace (GeM)"
                                     ),
                                     state="Pan India",
-                                    source_url=GEM_LISTING_URL,
+                                    source_url=target_url,
                                     tender_id=bid_no,
                                     organization="NOT VERIFIED",
                                     title=title[:500],
@@ -2815,23 +3267,20 @@ def crawl_gem():
                                     ),
                                 )
                             )
-
                             new_count += 1
 
                         log.info(
-                            "GeM | %s | page %d | %d new bids | total for search %d",
+                            "GeM %s | %s | page %d | %d new bids | total=%d",
+                            surface_name,
                             term,
                             page_number,
                             new_count,
-                            len(
-                                seen_bid_ids
-                            ),
+                            len(seen_bid_ids),
                         )
 
-                        # Locate an enabled Next control.
                         next_locator = None
 
-                        next_selectors = [
+                        for selector in [
                             'a:has-text("Next")',
                             'button:has-text("Next")',
                             'li.next a',
@@ -2840,9 +3289,7 @@ def crawl_gem():
                             'a[rel="next"]',
                             'button[title*="Next" i]',
                             'a[title*="Next" i]',
-                        ]
-
-                        for selector in next_selectors:
+                        ]:
                             try:
                                 locator = page.locator(
                                     selector
@@ -2882,14 +3329,15 @@ def crawl_gem():
 
                                 if (
                                     disabled
-                                    or aria_disabled
-                                    or "disabled" in classes
+                                    or
+                                    aria_disabled
+                                    or
+                                    "disabled" in classes
                                 ):
                                     continue
 
                                 next_locator = locator
                                 break
-
                             except Exception:
                                 continue
 
@@ -2902,7 +3350,6 @@ def crawl_gem():
                             next_locator.click(
                                 timeout=10000
                             )
-
                             page.wait_for_timeout(
                                 2500
                             )
@@ -2910,7 +3357,6 @@ def crawl_gem():
                             after_body = page.locator(
                                 "body"
                             ).inner_text()
-
                             after_html = page.content()
 
                             after_bids = extract_gem_bid_numbers(
@@ -2920,9 +3366,7 @@ def crawl_gem():
 
                             after_signature = hashlib.sha256(
                                 (
-                                    "|".join(
-                                        after_bids
-                                    )
+                                    "|".join(after_bids)
                                     + "|"
                                     + page.url
                                 ).encode(
@@ -2936,13 +3380,13 @@ def crawl_gem():
                                 before_signature
                             ):
                                 break
-
                         except Exception:
                             break
 
                 except Exception as error:
                     log.warning(
-                        "GeM search failed for [%s]: %s",
+                        "GeM %s search failed for [%s]: %s",
+                        surface_name,
                         term,
                         str(error)[:300],
                     )
@@ -2951,79 +3395,119 @@ def crawl_gem():
 
             if not search_ui_found:
                 raise RuntimeError(
-                    "GeM search UI was not found. "
-                    "Portal layout may have changed."
+                    f"GeM {surface_name} search UI was not found."
                 )
 
         unique = {}
 
-        for tender in results:
+        for tender in collected:
             key = (
                 tender.tender_id
                 or
                 tender.stable_key()
             )
 
-            # Prefer the record with the more descriptive title/real link.
-            existing = unique.get(
-                key
-            )
+            existing = unique.get(key)
 
             if existing is None:
                 unique[key] = tender
-            else:
-                score_existing = (
-                    int(
-                        bool(
-                            existing.discovered_doc_urls
-                        )
-                    )
-                    + len(
-                        existing.title or ""
-                    )
+                continue
+
+            existing_score = (
+                len(existing.title or "")
+                +
+                (
+                    100
+                    if existing.discovered_doc_urls
+                    else 0
                 )
+            )
 
-                score_new = (
-                    int(
-                        bool(
-                            tender.discovered_doc_urls
-                        )
-                    )
-                    + len(
-                        tender.title or ""
-                    )
+            new_score = (
+                len(tender.title or "")
+                +
+                (
+                    100
+                    if tender.discovered_doc_urls
+                    else 0
                 )
+            )
 
-                if score_new > score_existing:
-                    unique[key] = tender
+            if new_score > existing_score:
+                unique[key] = tender
 
-        output = list(
+        return list(
             unique.values()
         )
 
+    primary_error = ""
+
+    try:
+        primary_results = crawl_surface(
+            GEM_LISTING_URL,
+            "PRIMARY",
+        )
+
+        if primary_results:
+            return (
+                primary_results,
+                CrawlHealth(
+                    "Government e-Marketplace (GeM)",
+                    GEM_LISTING_URL,
+                    "SUCCESS",
+                    len(primary_results),
+                    "Primary GeM all-bids surface used.",
+                ),
+            )
+
+        log.warning(
+            "Primary GeM surface returned no matching bids. Trying GTE fallback."
+        )
+
+    except Exception as error:
+        primary_error = str(error)[:250]
+
+        log.warning(
+            "Primary GeM surface failed: %s",
+            primary_error,
+        )
+
+    try:
+        fallback_results = crawl_surface(
+            GEM_GTE_URL,
+            "GTE_FALLBACK",
+        )
+
+        if fallback_results:
+            return (
+                fallback_results,
+                CrawlHealth(
+                    "Government e-Marketplace (GeM)",
+                    GEM_GTE_URL,
+                    "FALLBACK_SUCCESS",
+                    len(fallback_results),
+                    (
+                        "Primary GeM unavailable/empty; "
+                        "GTE fallback used."
+                    ),
+                ),
+            )
+
         return (
-            output,
+            [],
             CrawlHealth(
                 "Government e-Marketplace (GeM)",
-                GEM_LISTING_URL,
+                GEM_GTE_URL,
+                "NO_RESULTS",
+                0,
                 (
-                    "SUCCESS"
-                    if output
-                    else "NO_RESULTS"
-                ),
-                len(output),
-                (
-                    ""
-                    if output
-                    else (
-                        "Standard GeM listing loaded, but no event/exhibition "
-                        "bids were discovered for the configured searches."
-                    )
+                    "Primary GeM unavailable/empty and "
+                    "GTE fallback returned no matching bids."
                 ),
             ),
         )
 
-    except Exception as error:
+    except Exception as fallback_error:
         return (
             [],
             CrawlHealth(
@@ -3031,7 +3515,12 @@ def crawl_gem():
                 GEM_LISTING_URL,
                 "PARSER_FAILED",
                 0,
-                str(error)[:250],
+                (
+                    "Primary error: "
+                    f"{primary_error or 'no matching results'}; "
+                    "Fallback error: "
+                    f"{str(fallback_error)[:180]}"
+                ),
             ),
         )
 
@@ -3044,32 +3533,184 @@ class DocumentManager:
     def __init__(self):
         self.http = session_with_headers()
 
+    def _document_relevance_score(
+        self,
+        candidate,
+        url,
+        label="",
+    ):
+        combined = normalize_space(
+            f"{label} {url}"
+        ).lower()
+
+        score = 0
+
+        tender_id = normalize_space(
+            candidate.tender_id or ""
+        ).lower()
+
+        numeric_parts = re.findall(
+            r"\d{5,}",
+            tender_id
+        )
+
+        if tender_id and tender_id in combined:
+            score += 6
+
+        if any(
+            part in combined
+            for part in numeric_parts
+        ):
+            score += 4
+
+        if "showbiddocument" in combined:
+            score += 5
+
+        if any(
+            term in combined
+            for term in [
+                "tender document",
+                "tender_document",
+                "tender-document",
+                "rfp",
+                "request for proposal",
+                "nit",
+                "notice inviting tender",
+                "eoi",
+                "expression of interest",
+                "rfq",
+                "boq",
+                "atc",
+                "corrigendum",
+                "addendum",
+                "annexure",
+                "eligibility",
+                "bid document",
+                "bid_document",
+            ]
+        ):
+            score += 3
+
+        if any(
+            bad in combined
+            for bad in [
+                "annual-report",
+                "annual_report",
+                "investor",
+                "brochure",
+                "product",
+                "contact",
+                "vendor-registration",
+                "vendor_registration",
+                "dividend",
+                "postal-ballot",
+                "postal_ballot",
+                "tds-guideline",
+                "material-events",
+                "gallery",
+                "news",
+            ]
+        ):
+            score -= 6
+
+        return score
+
+    def _filter_document_urls(
+        self,
+        candidate,
+        items,
+    ):
+        """
+        items can be URLs or (label, URL) tuples.
+        Keep only documents plausibly tied to this tender.
+        """
+        scored = []
+
+        for item in items:
+            if isinstance(
+                item,
+                tuple,
+            ):
+                label, url = item
+            else:
+                label, url = "", item
+
+            if not url:
+                continue
+
+            score = self._document_relevance_score(
+                candidate,
+                url,
+                label,
+            )
+
+            # Direct candidate detail document gets a modest boost.
+            if (
+                candidate.detail_url
+                and
+                url == candidate.detail_url
+                and
+                is_downloadable_url(
+                    url
+                )
+            ):
+                score += 2
+
+            if score >= 2:
+                scored.append(
+                    (
+                        score,
+                        url,
+                    )
+                )
+
+        scored.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        output = []
+
+        for _, url in scored:
+            if url not in output:
+                output.append(
+                    url
+                )
+
+        return output[:8]
+
     def discover_from_detail_page(
         self,
         candidate,
     ):
-        urls = list(
-            candidate.discovered_doc_urls
-        )
+        discovered_items = [
+            (
+                "",
+                url,
+            )
+            for url in candidate.discovered_doc_urls
+            if url
+        ]
 
         if not candidate.detail_url:
-            return list(
-                dict.fromkeys(
-                    urls
-                )
+            return self._filter_document_urls(
+                candidate,
+                discovered_items,
             )
 
         if is_downloadable_url(
             candidate.detail_url
         ):
-            urls.append(
-                candidate.detail_url
+            discovered_items.append(
+                (
+                    candidate.title,
+                    candidate.detail_url,
+                )
             )
 
-            return list(
-                dict.fromkeys(
-                    urls
-                )
+            return self._filter_document_urls(
+                candidate,
+                discovered_items,
             )
 
         try:
@@ -3080,10 +3721,9 @@ class DocumentManager:
             )
 
             if response.status_code != 200:
-                return list(
-                    dict.fromkeys(
-                        urls
-                    )
+                return self._filter_document_urls(
+                    candidate,
+                    discovered_items,
                 )
 
             content_type = (
@@ -3094,34 +3734,22 @@ class DocumentManager:
             ).lower()
 
             if "application/pdf" in content_type:
-                urls.append(
-                    response.url
+                discovered_items.append(
+                    (
+                        candidate.title,
+                        response.url,
+                    )
                 )
 
-                return list(
-                    dict.fromkeys(
-                        urls
-                    )
+                return self._filter_document_urls(
+                    candidate,
+                    discovered_items,
                 )
 
             soup = BeautifulSoup(
                 response.text,
                 "html.parser",
             )
-
-            relevant_labels = [
-                "download",
-                "tender document",
-                "rfp",
-                "atc",
-                "corrigendum",
-                "nit",
-                "boq",
-                "annexure",
-                "eligibility",
-                "pre-bid",
-                "pre bid",
-            ]
 
             for anchor in soup.find_all(
                 "a",
@@ -3139,7 +3767,10 @@ class DocumentManager:
                         " ",
                         strip=True,
                     )
-                ).lower()
+                )
+
+                if not url:
+                    continue
 
                 if (
                     is_downloadable_url(
@@ -3147,19 +3778,40 @@ class DocumentManager:
                     )
                     or
                     any(
-                        item in label
-                        for item in relevant_labels
+                        term in (
+                            label
+                            + " "
+                            + url
+                        ).lower()
+                        for term in [
+                            "tender",
+                            "rfp",
+                            "nit",
+                            "eoi",
+                            "rfq",
+                            "boq",
+                            "atc",
+                            "corrigendum",
+                            "addendum",
+                            "annexure",
+                            "bid document",
+                            "eligibility",
+                        ]
                     )
                 ):
-                    urls.append(url)
+                    discovered_items.append(
+                        (
+                            label,
+                            url,
+                        )
+                    )
 
         except requests.RequestException:
             pass
 
-        return list(
-            dict.fromkeys(
-                urls
-            )
+        return self._filter_document_urls(
+            candidate,
+            discovered_items,
         )
 
     def download_and_extract(
@@ -4253,11 +4905,8 @@ def existing_tender_keys(
 
 def clean_active_tenders_sheet(sheet):
     """
-    Remove stale false-positive rows created by older crawler logic.
-
-    This does NOT delete valid event tenders merely because AI extraction
-    failed. It only removes rows whose tender title fails the same strict
-    relevance test used for new candidates.
+    Remove stale false positives and malformed rows from older crawler logic.
+    Keeps only rows that still look like a specific event-related procurement.
     """
 
     if not CLEAN_EXISTING_ACTIVE_TENDERS:
@@ -4270,11 +4919,37 @@ def clean_active_tenders_sheet(sheet):
 
     headers = values[0]
 
-    try:
-        title_index = headers.index(
-            "Tender Title & Scope"
-        )
-    except ValueError:
+    def idx(name):
+        try:
+            return headers.index(
+                name
+            )
+        except ValueError:
+            return None
+
+    title_index = idx(
+        "Tender Title & Scope"
+    )
+    tender_id_index = idx(
+        "Tender ID / Ref No"
+    )
+    portal_index = idx(
+        "Portal Name"
+    )
+    state_index = idx(
+        "State"
+    )
+    org_index = idx(
+        "Organization / Dept"
+    )
+    detail_index = idx(
+        "Portal / Detail Link"
+    )
+    docs_index = idx(
+        "RFP / Tender Doc URLs"
+    )
+
+    if title_index is None:
         log.warning(
             "Cannot clean Active_Tenders: title column not found."
         )
@@ -4302,41 +4977,301 @@ def clean_active_tenders_sheet(sheet):
         ):
             continue
 
-        if is_relevant_event_title(
-            title
-        ):
+        detail_url = (
+            padded[detail_index]
+            if detail_index is not None
+            else ""
+        )
+
+        candidate = TenderCandidate(
+            portal=(
+                padded[portal_index]
+                if portal_index is not None
+                else ""
+            ),
+            state=(
+                padded[state_index]
+                if state_index is not None
+                else "Pan India"
+            ),
+            source_url=detail_url,
+            tender_id=(
+                padded[tender_id_index]
+                if tender_id_index is not None
+                else ""
+            ),
+            organization=(
+                padded[org_index]
+                if org_index is not None
+                else ""
+            ),
+            title=title,
+            detail_url=detail_url,
+            discovered_doc_urls=(
+                [
+                    item
+                    for item in (
+                        padded[docs_index].splitlines()
+                        if docs_index is not None
+                        else []
+                    )
+                    if item
+                ]
+            ),
+        )
+
+        keep = (
+            is_relevant_event_title(
+                title
+            )
+            and
+            is_procurement_candidate(
+                candidate
+            )
+        )
+
+        # Remove obviously corrupted historic rows such as "35" in URL/status cells.
+        if keep:
+            invalid_scalar = False
+
+            for field_name in [
+                "RFP / Tender Doc URLs",
+                "Portal / Detail Link",
+                "AI Model Used",
+                "Extraction Status",
+            ]:
+                field_index = idx(
+                    field_name
+                )
+
+                if field_index is None:
+                    continue
+
+                value = normalize_space(
+                    padded[
+                        field_index
+                    ]
+                )
+
+                if value.isdigit():
+                    invalid_scalar = True
+                    break
+
+            if invalid_scalar:
+                keep = False
+
+        if keep:
             kept_rows.append(
                 padded
             )
         else:
             removed += 1
+
             log.info(
-                "Removing stale false-positive tracker row: %s",
+                "Removing stale/invalid tracker row: %s",
                 title[:160],
             )
 
-    if removed:
-        sheet.clear()
+    sheet.clear()
 
-        output = [
-            headers
-        ] + kept_rows
+    output = [
+        headers
+    ] + kept_rows
 
-        sheet.update(
-            values=output,
-            range_name=(
-                f"A1:Z{len(output)}"
-            ),
-        )
+    sheet.update(
+        values=output,
+        range_name=(
+            f"A1:Z{len(output)}"
+        ),
+    )
 
-        log.info(
-            "Cleaned Active_Tenders: removed %d false-positive rows, "
-            "kept %d rows.",
-            removed,
-            len(kept_rows),
-        )
+    log.info(
+        "Cleaned Active_Tenders: removed %d stale/invalid rows, kept %d rows.",
+        removed,
+        len(kept_rows),
+    )
 
     return removed
+
+
+
+VALID_EXTRACTION_STATUSES = {
+    "OK",
+    "SUCCESS",
+    "NO_DOCUMENT_TEXT",
+    "OPENAI_API_KEY_MISSING",
+    "OPENAI_DISABLED_FOR_RUN",
+    "OPENAI_QUOTA_EXHAUSTED",
+    "OPENAI_AUTH_ERROR",
+    "OPENAI_MODEL_ERROR",
+    "OPENAI_ERROR",
+    "PARSE_FAILED",
+    "UNKNOWN",
+}
+
+
+def sanitize_active_row(row):
+    if len(row) != len(
+        ACTIVE_HEADERS
+    ):
+        raise ValueError(
+            f"Active_Tenders row has {len(row)} columns; "
+            f"expected {len(ACTIVE_HEADERS)}."
+        )
+
+    clean = []
+
+    for value in row:
+        if value is None:
+            clean.append(
+                ""
+            )
+        elif isinstance(
+            value,
+            (
+                int,
+                float,
+            ),
+        ):
+            clean.append(
+                value
+            )
+        else:
+            clean.append(
+                str(value).strip()
+            )
+
+    mapping = dict(
+        zip(
+            ACTIVE_HEADERS,
+            clean,
+        )
+    )
+
+    title = normalize_space(
+        mapping[
+            "Tender Title & Scope"
+        ]
+    )
+
+    if not title:
+        raise ValueError(
+            "Tender title is blank."
+        )
+
+    detail_link = normalize_space(
+        mapping[
+            "Portal / Detail Link"
+        ]
+    )
+
+    if (
+        detail_link
+        and
+        detail_link.isdigit()
+    ):
+        raise ValueError(
+            "Portal/detail link is numeric corruption."
+        )
+
+    doc_urls = normalize_space(
+        mapping[
+            "RFP / Tender Doc URLs"
+        ]
+    )
+
+    if (
+        doc_urls
+        and
+        doc_urls.isdigit()
+    ):
+        raise ValueError(
+            "Tender document URLs field is numeric corruption."
+        )
+
+    ai_model = normalize_space(
+        mapping[
+            "AI Model Used"
+        ]
+    )
+
+    if ai_model.isdigit():
+        clean[
+            ACTIVE_HEADERS.index(
+                "AI Model Used"
+            )
+        ] = ""
+
+    extraction_status = normalize_space(
+        mapping[
+            "Extraction Status"
+        ]
+    )
+
+    if (
+        extraction_status
+        and
+        extraction_status not in VALID_EXTRACTION_STATUSES
+    ):
+        clean[
+            ACTIVE_HEADERS.index(
+                "Extraction Status"
+            )
+        ] = "UNKNOWN"
+
+    return clean
+
+
+def write_active_rows_exact(
+    sheet,
+    rows,
+):
+    if not rows:
+        return 0
+
+    validated = []
+
+    for row in rows:
+        try:
+            validated.append(
+                sanitize_active_row(
+                    row
+                )
+            )
+        except Exception as error:
+            log.error(
+                "Rejecting malformed Active_Tenders row: %s",
+                error,
+            )
+
+    if not validated:
+        return 0
+
+    existing = sheet.get_all_values()
+
+    start_row = max(
+        2,
+        len(existing) + 1,
+    )
+
+    end_row = (
+        start_row
+        + len(validated)
+        - 1
+    )
+
+    sheet.update(
+        values=validated,
+        range_name=(
+            f"A{start_row}:Z{end_row}"
+        ),
+        value_input_option="RAW",
+    )
+
+    return len(
+        validated
+    )
+
 
 
 def sync_portal_directory(
@@ -4348,13 +5283,32 @@ def sync_portal_directory(
         PORTAL_HEADERS
     ]
 
+    gem_health = health.get(
+        "Government e-Marketplace (GeM)"
+    )
+
     for portal in portals:
-        # Prefer exact portal-name health.
         status = health.get(
             portal.portal
         )
 
-        # GeM master naming can differ; map by URL as fallback.
+        # GeM master sheet may contain separate standard and BidPlus/GTE rows.
+        # Reuse the actual GeM run status rather than leaving stale NOT_RUN junk.
+        if (
+            status is None
+            and
+            gem_health is not None
+            and
+            (
+                "gem.gov.in"
+                in portal.url.lower()
+                or
+                "bidplus"
+                in portal.url.lower()
+            )
+        ):
+            status = gem_health
+
         if status is None:
             for candidate_health in health.values():
                 if (
@@ -4367,32 +5321,71 @@ def sync_portal_directory(
                     status = candidate_health
                     break
 
+        checked_at = (
+            str(
+                status.checked_at
+                or ""
+            ).strip()
+            if status
+            else ""
+        )
+
+        if (
+            checked_at
+            and
+            not re.match(
+                r"^\d{4}-\d{2}-\d{2} ",
+                checked_at,
+            )
+        ):
+            checked_at = ""
+
+        crawler_status = (
+            str(
+                status.status
+                or "NOT_RUN"
+            ).strip()
+            if status
+            else "NOT_RUN"
+        )
+
+        if crawler_status.isdigit():
+            crawler_status = "UNKNOWN"
+
+        message = (
+            str(
+                status.message
+                or ""
+            ).strip()
+            if status
+            else ""
+        )
+
+        if message.isdigit():
+            message = ""
+
+        try:
+            discovered_count = (
+                int(
+                    status.discovered_count
+                    or 0
+                )
+                if status
+                else 0
+            )
+        except Exception:
+            discovered_count = 0
+
         rows.append([
             portal.portal,
             portal.category,
             portal.state,
             portal.url,
             portal.active,
-            (
-                status.checked_at
-                if status
-                else ""
-            ),
-            (
-                status.discovered_count
-                if status
-                else 0
-            ),
-            (
-                status.status
-                if status
-                else "NOT_RUN"
-            ),
-            (
-                status.message
-                if status
-                else ""
-            ),
+            checked_at,
+            discovered_count,
+            crawler_status,
+            message,
             portal.priority,
         ])
 
@@ -4401,6 +5394,12 @@ def sync_portal_directory(
     sheet.update(
         values=rows,
         range_name=f"A1:J{len(rows)}",
+        value_input_option="RAW",
+    )
+
+    log.info(
+        "Portal_Directory rewritten with %d portal rows.",
+        len(rows) - 1,
     )
 
 
@@ -4433,12 +5432,33 @@ def filter_event_candidates(
             )
             continue
 
+        procurement_score, procurement_reasons = (
+            procurement_intent_score(
+                candidate
+            )
+        )
+
+        if procurement_score < 3:
+            rejected.append(
+                candidate
+            )
+
+            log.info(
+                "Skipping non-procurement content: %s | score=%d | %s",
+                candidate.title[:150],
+                procurement_score,
+                ", ".join(
+                    procurement_reasons
+                )[:250],
+            )
+            continue
+
         filtered.append(
             candidate
         )
 
     log.info(
-        "Event relevance filter: %d kept / %d rejected",
+        "Event + procurement filter: %d kept / %d rejected",
         len(filtered),
         len(rejected),
     )
@@ -4483,6 +5503,12 @@ def process_candidate(
         documents,
     )
 
+    evidence = merge_deterministic_metadata(
+        candidate,
+        documents,
+        evidence,
+    )
+
     decision = evaluate_qualification(
         evidence
     )
@@ -4498,7 +5524,63 @@ def process_candidate(
 # 19. MAIN PIPELINE
 # =============================================================================
 
+def validate_deployed_build():
+    """
+    Fail immediately if GitHub is running an older/incomplete file.
+    """
+    required_functions = [
+        "procurement_intent_score",
+        "extract_deterministic_metadata",
+        "merge_deterministic_metadata",
+        "sanitize_active_row",
+        "write_active_rows_exact",
+        "clean_active_tenders_sheet",
+        "sync_portal_directory",
+        "crawl_gem",
+    ]
+
+    missing = [
+        name
+        for name in required_functions
+        if name not in globals()
+    ]
+
+    log.info(
+        "Crawler code version: %s",
+        CODE_VERSION,
+    )
+    log.info(
+        "Strict procurement gate enabled: %s",
+        "procurement_intent_score" in globals(),
+    )
+    log.info(
+        "Active tender cleanup enabled: %s",
+        CLEAN_EXISTING_ACTIVE_TENDERS,
+    )
+    log.info(
+        "Generic JS fallback enabled: %s",
+        GENERIC_JS_FALLBACK,
+    )
+    log.info(
+        "GeM primary URL: %s",
+        GEM_LISTING_URL,
+    )
+    log.info(
+        "GeM fallback URL: %s",
+        GEM_GTE_URL,
+    )
+
+    if missing:
+        raise RuntimeError(
+            "Outdated/incomplete tender_agent.py deployed. "
+            f"Missing functions: {missing}"
+        )
+
+
+
 def run_pipeline():
+    validate_deployed_build()
+
     started_at = time.time()
 
     log.info(
@@ -4661,6 +5743,29 @@ def run_pipeline():
         tender_key = candidate.stable_key()
 
         if tender_key in existing_keys:
+            continue
+
+        # Last safety layer before downloading documents or writing to Sheets.
+        if not is_relevant_event_title(
+            candidate.title
+        ):
+            log.warning(
+                "FINAL WRITE BLOCKED - non-event title: %s",
+                candidate.title[:200],
+            )
+            continue
+
+        procurement_score, procurement_reasons = procurement_intent_score(
+            candidate
+        )
+
+        if procurement_score < 3:
+            log.warning(
+                "FINAL WRITE BLOCKED - no procurement intent: %s | score=%d | %s",
+                candidate.title[:200],
+                procurement_score,
+                ", ".join(procurement_reasons)[:250],
+            )
             continue
 
         log.info(
@@ -4943,14 +6048,14 @@ def run_pipeline():
         )
 
     if new_rows:
-        active_sheet.append_rows(
+        written = write_active_rows_exact(
+            active_sheet,
             new_rows,
-            value_input_option="RAW",
         )
 
         log.info(
-            "Successfully added %d new tender records.",
-            len(new_rows),
+            "Successfully added %d validated new tender records.",
+            written,
         )
     else:
         log.info(
