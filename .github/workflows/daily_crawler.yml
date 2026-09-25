@@ -1,0 +1,68 @@
+name: Daily Event Tender Crawler
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 03:00 UTC = 08:30 AM IST
+    - cron: "0 3 * * *"
+
+jobs:
+  crawl-tenders:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 45
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      SERVICE_ACCOUNT_FILE: service_account.json
+      EXCEL_MASTER_FILE: Pan_India_Tender_URL_Master.xlsx
+      DOWNLOAD_DIR: tender_downloads
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Create Google service account file
+        run: |
+          echo '${{ secrets.GCP_SA_KEY }}' > service_account.json
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile tender_agent.py
+
+      - name: Run Tender Intelligence Agent
+        run: |
+          python tender_agent.py
+
+      - name: Upload downloaded tender documents
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tender-documents
+          path: tender_downloads/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove service account file
+        if: always()
+        run: |
+          rm -f service_account.json
