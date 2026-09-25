@@ -19,6 +19,8 @@ jobs:
       SERVICE_ACCOUNT_FILE: service_account.json
       EXCEL_MASTER_FILE: Pan_India_Tender_URL_Master.xlsx
       DOWNLOAD_DIR: tender_downloads
+      CRAWL_WORKERS: 10
+      REQUEST_TIMEOUT: 20
 
     steps:
       - name: Checkout repository
