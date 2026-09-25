@@ -470,13 +470,26 @@ def infer_category(title):
         item in text
         for item in [
             "exhibition",
-            "stall",
+            "exhibition stall",
+            "stall design",
+            "stall fabrication",
             "pavilion",
+            "expo",
+            "trade fair",
         ]
     ):
         return "Exhibition / Stall"
 
-    if "empanel" in text:
+    if "empanel" in text and any(
+        item in text
+        for item in [
+            "event",
+            "advertising",
+            "creative",
+            "publicity",
+            "media",
+        ]
+    ):
         return "Empanelment"
 
     if any(
@@ -494,12 +507,14 @@ def infer_category(title):
     if any(
         item in text
         for item in [
-            "advertising",
-            "media campaign",
+            "advertising agency",
             "creative agency",
-            "publicity",
-            "outreach",
+            "media campaign",
+            "publicity campaign",
+            "outreach campaign",
             "iec campaign",
+            "communication agency",
+            "pr agency",
         ]
     ):
         return "Advertising / Creative / Outreach"
@@ -509,12 +524,32 @@ def infer_category(title):
         for item in [
             "festival",
             "mela",
-            "cultural",
+            "cultural event",
+            "cultural programme",
         ]
     ):
         return "Festival / Mela / Cultural"
 
-    return "Event / Experiential"
+    if any(
+        item in text
+        for item in [
+            "event management",
+            "event agency",
+            "event production",
+            "corporate event",
+            "annual day",
+            "foundation day",
+            "award ceremony",
+            "brand activation",
+            "experiential marketing",
+            "roadshow",
+            "dealer meet",
+            "launch event",
+        ]
+    ):
+        return "Event / Experiential"
+
+    return "Unclassified"
 
 
 def safe_urljoin(base, href):
@@ -575,38 +610,119 @@ def valid_tender_title(title):
 
 def is_relevant_event_tender(candidate):
     """
-    Conservative event relevance filter.
+    Strict title-based event relevance filter.
 
-    Important:
-    - rejects obvious non-event procurement
-    - requires at least one strong event/exhibition/creative term
+    Relevance is decided from the actual tender/link title only.
+    The inferred category is NOT used for acceptance because generic
+    categories can otherwise create false positives.
     """
 
-    title = (
-        candidate.title
-        or ""
+    title = normalize_space(
+        candidate.title or ""
     ).lower()
 
-    category = (
-        candidate.category
-        or ""
-    ).lower()
+    if not title:
+        return False
 
-    hits = " ".join(
-        candidate.keyword_hits
-        or []
-    ).lower()
+    generic_titles = {
+        "dae secretariat matters",
+        "dae unit tenders",
+        "dae procurement plan",
+        "list of internal dae tenders",
+        "public sector units",
+        "government initiatives",
+        "news updates",
+        "downloads",
+        "e-tender",
+        "tender creation",
+        "tender terms",
+        "procurement plan",
+        "latest tenders",
+        "active tenders",
+        "tenders",
+        "tender document",
+        "tender notices",
+        "notice",
+        "notices",
+    }
 
-    text = f"{title} {category} {hits}"
+    if title in generic_titles:
+        return False
 
     for exclusion in NON_EVENT_EXCLUSIONS:
-        if exclusion in text:
+        if exclusion in title:
             return False
 
-    return any(
-        keyword in text
-        for keyword in STRONG_EVENT_TERMS
-    )
+    strong_phrases = [
+        "event management",
+        "event agency",
+        "event management agency",
+        "event production",
+        "event logistics",
+        "exhibition",
+        "exhibition stall",
+        "exhibition pavilion",
+        "stall design",
+        "stall fabrication",
+        "expo",
+        "trade fair",
+        "conference",
+        "seminar",
+        "convention",
+        "summit",
+        "conclave",
+        "roadshow",
+        "dealer meet",
+        "annual day",
+        "foundation day",
+        "award ceremony",
+        "cultural programme",
+        "cultural event",
+        "brand activation",
+        "experiential marketing",
+        "publicity campaign",
+        "outreach campaign",
+        "iec campaign",
+        "advertising agency",
+        "creative agency",
+        "communication agency",
+        "pr agency",
+        "audio visual",
+        "av production",
+        "sound and light",
+        "stage setup",
+        "stage production",
+        "tentage",
+        "festival",
+        "mela",
+        "launch event",
+        "product launch",
+        "tourism event",
+        "sports event",
+    ]
+
+    if any(
+        phrase in title
+        for phrase in strong_phrases
+    ):
+        return True
+
+    if "empanel" in title:
+        if any(
+            phrase in title
+            for phrase in [
+                "event",
+                "exhibition",
+                "advertising",
+                "creative",
+                "media",
+                "publicity",
+                "communication",
+            ]
+        ):
+            return True
+
+    return False
 
 
 def extract_ref_candidates(text):
@@ -1374,9 +1490,7 @@ class TenderCrawler:
                 )
 
                 hits = keyword_hits(
-                    text
-                    + " "
-                    + label
+                    label
                 )
 
                 if not hits:
