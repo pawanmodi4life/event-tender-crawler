@@ -2,9 +2,9 @@ name: Daily Event Tender Agent
 
 on:
   schedule:
-    # 03:00 UTC corresponds to 08:30 AM IST every day
+    # 03:00 UTC = 08:30 AM IST every day
     - cron: '0 3 * * *'
-  workflow_dispatch: # Enables manual trigger button in GitHub UI
+  workflow_dispatch:
 
 jobs:
   run-crawler:
@@ -20,7 +20,8 @@ jobs:
 
       - name: Install Application Dependencies
         run: |
-          pip install playwright gspread google-auth google-api-python-client google-genai
+          pip install --upgrade pip
+          pip install playwright gspread google-auth google-api-python-client google-genai requests beautifulsoup4 pandas openpyxl
           playwright install --with-deps chromium
 
       - name: Decrypt Credentials & Run Pipeline
