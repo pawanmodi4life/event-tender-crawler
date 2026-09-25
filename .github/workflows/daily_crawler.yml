@@ -3,6 +3,13 @@ name: Daily Event Tender Crawler
 on:
   workflow_dispatch:
 
+  push:
+    branches:
+      - main
+    paths:
+      - "tender_agent.py"
+      - ".github/workflows/daily_crawler.yml"
+
   schedule:
     # 03:00 UTC = 08:30 AM IST
     - cron: "0 3 * * *"
@@ -26,6 +33,13 @@ jobs:
 
       CRAWL_WORKERS: 10
       REQUEST_TIMEOUT: 20
+
+      MAX_GENERIC_LINKS: 100
+      MAX_GENERIC_PAGES: 50
+      MAX_PAGES_PER_PORTAL: 100
+      MAX_GEM_PAGES_PER_SEARCH: 50
+      GENERIC_JS_FALLBACK: true
+      CLEAN_EXISTING_ACTIVE_TENDERS: true
 
     steps:
 
