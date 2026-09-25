@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-DATE-GEM-FIX-V7"
+CODE_VERSION = "2026-09-25-ACTIVE-DEADLINE-FILTER-V8"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -1748,6 +1748,173 @@ def _extract_date_field(text_value, label_patterns):
                 return candidate
 
     return ""
+
+
+def _parse_deadline_datetime(value):
+    """
+    Parse common Indian tender deadline formats.
+
+    Returns an IST-aware datetime when possible.
+    If a date has no time, it is treated as valid through 23:59:59 IST.
+    """
+    text_value = normalize_space(
+        value or ""
+    )
+
+    if not text_value:
+        return None
+
+    if text_value.upper() in {
+        "NOT VERIFIED",
+        "NOT STATED",
+        "NOT VERIFIED / NOT STATED",
+        "N/A",
+        "NA",
+        "NONE",
+    }:
+        return None
+
+    # Normalise punctuation and ordinal suffixes.
+    cleaned = re.sub(
+        r"(\d{1,2})(st|nd|rd|th)\b",
+        r"\1",
+        text_value,
+        flags=re.I,
+    )
+
+    cleaned = cleaned.replace(
+        ",",
+        " ",
+    )
+
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        cleaned,
+    ).strip()
+
+    # Extract the most likely date/time substring rather than attempting
+    # to parse surrounding tender prose.
+    candidates = []
+
+    for match in re.finditer(
+        r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}"
+        r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?\b",
+        cleaned,
+        flags=re.I,
+    ):
+        candidates.append(
+            match.group(0)
+        )
+
+    for match in re.finditer(
+        r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}"
+        r"(?:[T\s]+\d{1,2}:\d{2}(?::\d{2})?)?\b",
+        cleaned,
+        flags=re.I,
+    ):
+        candidates.append(
+            match.group(0)
+        )
+
+    for match in re.finditer(
+        r"\b\d{1,2}\s+"
+        r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\s+\d{4}"
+        r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?\b",
+        cleaned,
+        flags=re.I,
+    ):
+        candidates.append(
+            match.group(0)
+        )
+
+    formats = [
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%d/%m/%Y %I:%M %p",
+        "%d-%m-%Y %I:%M %p",
+        "%d.%m.%Y %I:%M %p",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+        "%d/%m/%y",
+        "%d-%m-%y",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%d %B %Y %H:%M",
+        "%d %B %Y %I:%M %p",
+        "%d %B %Y",
+        "%d %b %Y %H:%M",
+        "%d %b %Y %I:%M %p",
+        "%d %b %Y",
+    ]
+
+    for candidate in candidates:
+        candidate_clean = re.sub(
+            r"\s+at\s+",
+            " ",
+            candidate,
+            flags=re.I,
+        )
+
+        for fmt in formats:
+            try:
+                parsed = dt.datetime.strptime(
+                    candidate_clean,
+                    fmt,
+                )
+
+                has_time = any(
+                    token in fmt
+                    for token in [
+                        "%H",
+                        "%I",
+                    ]
+                )
+
+                if not has_time:
+                    parsed = parsed.replace(
+                        hour=23,
+                        minute=59,
+                        second=59,
+                    )
+
+                return parsed.replace(
+                    tzinfo=IST
+                )
+
+            except ValueError:
+                continue
+
+    return None
+
+
+def submission_deadline_is_open(value):
+    """
+    Strict active-tender gate.
+
+    Only a tender with a VERIFIED, parseable submission deadline that has
+    not passed is eligible for Active_Tenders. Unknown/blank dates are rejected.
+    """
+    parsed = _parse_deadline_datetime(
+        value
+    )
+
+    if parsed is None:
+        return False
+
+    return parsed >= dt.datetime.now(
+        tz=IST
+    )
 
 def extract_deterministic_metadata(
     candidate,
@@ -5731,6 +5898,13 @@ def clean_active_tenders_sheet(sheet):
             candidate
         )
 
+        deadline_open = submission_deadline_is_open(
+            old_value(
+                row,
+                "Submission Deadline",
+            )
+        )
+
         keep = (
             is_relevant_event_title(
                 title
@@ -5741,6 +5915,8 @@ def clean_active_tenders_sheet(sheet):
             is_procurement_candidate(
                 candidate
             )
+            and
+            deadline_open
         )
 
         if keep:
@@ -6351,6 +6527,8 @@ def validate_deployed_build():
         "is_event_service_candidate",
         "is_expired_candidate",
         "_extract_date_field",
+        "submission_deadline_is_open",
+        "_parse_deadline_datetime",
     ]
 
     missing = [
@@ -6640,6 +6818,20 @@ def run_pipeline():
             candidate,
             document_manager,
         )
+
+        verified_deadline = evidence.get(
+            "submission_deadline"
+        ) or candidate.deadline_raw
+
+        if not submission_deadline_is_open(
+            verified_deadline
+        ):
+            log.info(
+                "FINAL WRITE BLOCKED - submission deadline missing/invalid/closed: %s | deadline=%s",
+                candidate.title[:180],
+                verified_deadline or "NOT VERIFIED",
+            )
+            continue
 
         downloaded_files = [
             document.local_path
