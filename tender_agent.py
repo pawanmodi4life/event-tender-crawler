@@ -125,6 +125,28 @@ MAX_DOCUMENTS_PER_TENDER = int(
 )
 
 
+MAX_PAGES_PER_PORTAL = int(
+    os.getenv(
+        "MAX_PAGES_PER_PORTAL",
+        "100",
+    )
+)
+
+MAX_GEM_PAGES_PER_SEARCH = int(
+    os.getenv(
+        "MAX_GEM_PAGES_PER_SEARCH",
+        "50",
+    )
+)
+
+MAX_GENERIC_PAGES = int(
+    os.getenv(
+        "MAX_GENERIC_PAGES",
+        "50",
+    )
+)
+
+
 CLEAN_EXISTING_ACTIVE_TENDERS = (
     os.getenv(
         "CLEAN_EXISTING_ACTIVE_TENDERS",
@@ -1274,6 +1296,16 @@ class TenderCrawler:
         self,
         portal,
     ):
+        """
+        Crawl GePNIC/CPPP-style listings with pagination.
+
+        Strategy:
+        - load latest active tenders page
+        - parse current page
+        - discover/follow Next/page links
+        - stop on repeat page, disabled Next, no new records, or max pages
+        """
+
         base = portal.url.rstrip("/")
 
         candidate_urls = []
@@ -1311,8 +1343,8 @@ class TenderCrawler:
             base,
         ])
 
-        html = ""
-        final_url = ""
+        first_html = ""
+        first_url = ""
 
         for url in dict.fromkeys(
             candidate_urls
@@ -1329,135 +1361,211 @@ class TenderCrawler:
                     and
                     len(response.text) > 500
                 ):
-                    html = response.text
-                    final_url = response.url
+                    first_html = response.text
+                    first_url = response.url
                     break
 
             except requests.RequestException:
                 continue
 
-        if not html:
+        if not first_html:
             raise RuntimeError(
                 "No usable GePNIC page returned."
             )
 
-        lower_html = html.lower()
-
         if (
-            "captcha" in lower_html
+            "captcha" in first_html.lower()
             and
-            len(html) < 100000
+            len(first_html) < 100000
         ):
             raise RuntimeError(
                 "CAPTCHA_OR_LOGIN_REQUIRED"
             )
 
-        soup = BeautifulSoup(
+        def parse_page(
             html,
-            "html.parser",
-        )
-
-        results = []
-
-        for row in soup.find_all(
-            "tr"
+            page_url,
         ):
-            row_text = normalize_space(
-                row.get_text(
-                    " ",
-                    strip=True,
-                )
+            soup = BeautifulSoup(
+                html,
+                "html.parser",
             )
 
-            hits = keyword_hits(
-                row_text
-            )
+            page_results = []
 
-            if not hits:
-                continue
-
-            cells = [
-                normalize_space(
-                    td.get_text(
+            for row in soup.find_all(
+                "tr"
+            ):
+                row_text = normalize_space(
+                    row.get_text(
                         " ",
                         strip=True,
                     )
                 )
-                for td in row.find_all(
-                    "td"
+
+                hits = keyword_hits(
+                    row_text
                 )
-            ]
 
-            if len(cells) < 2:
-                continue
+                if not hits:
+                    continue
 
-            # Prefer link text when available.
-            anchor_titles = [
-                normalize_space(
-                    a.get_text(
-                        " ",
-                        strip=True,
+                cells = [
+                    normalize_space(
+                        td.get_text(
+                            " ",
+                            strip=True,
+                        )
                     )
-                )
-                for a in row.find_all(
-                    "a"
-                )
-                if valid_tender_title(
+                    for td in row.find_all(
+                        "td"
+                    )
+                ]
+
+                if len(cells) < 2:
+                    continue
+
+                anchor_titles = [
                     normalize_space(
                         a.get_text(
                             " ",
                             strip=True,
                         )
                     )
-                )
-            ]
-
-            if anchor_titles:
-                title = max(
-                    anchor_titles,
-                    key=len,
-                )
-            else:
-                usable_cells = [
-                    cell
-                    for cell in cells
+                    for a in row.find_all(
+                        "a"
+                    )
                     if valid_tender_title(
-                        cell
+                        normalize_space(
+                            a.get_text(
+                                " ",
+                                strip=True,
+                            )
+                        )
                     )
                 ]
 
-                if not usable_cells:
+                if anchor_titles:
+                    title = max(
+                        anchor_titles,
+                        key=len,
+                    )
+                else:
+                    usable_cells = [
+                        cell
+                        for cell in cells
+                        if valid_tender_title(
+                            cell
+                        )
+                    ]
+
+                    if not usable_cells:
+                        continue
+
+                    title = max(
+                        usable_cells,
+                        key=len,
+                    )
+
+                if not valid_tender_title(
+                    title
+                ):
                     continue
 
-                title = max(
-                    usable_cells,
-                    key=len,
+                refs = extract_ref_candidates(
+                    row_text
                 )
 
-            if not valid_tender_title(
-                title
-            ):
-                continue
+                tender_id = (
+                    refs[0]
+                    if refs
+                    else ""
+                )
 
-            refs = extract_ref_candidates(
-                row_text
-            )
+                detail_url = page_url
+                documents = []
 
-            tender_id = (
-                refs[0]
-                if refs
-                else ""
-            )
+                for anchor in row.find_all(
+                    "a",
+                    href=True,
+                ):
+                    href = safe_urljoin(
+                        page_url,
+                        anchor.get(
+                            "href"
+                        ),
+                    )
 
-            detail_url = final_url
-            documents = []
+                    if not href:
+                        continue
 
-            for anchor in row.find_all(
+                    if href.lower().startswith(
+                        "javascript:"
+                    ):
+                        continue
+
+                    anchor_text = normalize_space(
+                        anchor.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+
+                    if is_downloadable_url(
+                        href
+                    ):
+                        documents.append(
+                            href
+                        )
+
+                    elif any(
+                        item
+                        in (
+                            anchor_text
+                            + " "
+                            + href
+                        ).lower()
+                        for item in TENDERISH_TERMS
+                    ):
+                        detail_url = href
+
+                page_results.append(
+                    TenderCandidate(
+                        portal=portal.portal,
+                        state=portal.state,
+                        source_url=page_url,
+                        tender_id=tender_id,
+                        organization=portal.portal,
+                        title=title[:500],
+                        category=infer_category(
+                            title
+                        ),
+                        detail_url=detail_url,
+                        discovered_doc_urls=list(
+                            dict.fromkeys(
+                                documents
+                            )
+                        ),
+                        keyword_hits=hits,
+                    )
+                )
+
+            # Pagination candidates: explicit Next plus numbered page links.
+            next_urls = []
+
+            for anchor in soup.find_all(
                 "a",
                 href=True,
             ):
+                label = normalize_space(
+                    anchor.get_text(
+                        " ",
+                        strip=True,
+                    )
+                ).lower()
+
                 href = safe_urljoin(
-                    final_url,
+                    page_url,
                     anchor.get(
                         "href"
                     ),
@@ -1471,51 +1579,136 @@ class TenderCrawler:
                 ):
                     continue
 
-                anchor_text = normalize_space(
-                    anchor.get_text(
-                        " ",
-                        strip=True,
+                if (
+                    label in {
+                        "next",
+                        "next >",
+                        "next »",
+                        ">",
+                        "»",
+                    }
+                    or
+                    "next" in label
+                    or
+                    re.fullmatch(
+                        r"\d+",
+                        label or "",
                     )
-                )
-
-                if is_downloadable_url(
-                    href
                 ):
-                    documents.append(
+                    next_urls.append(
                         href
                     )
 
-                elif any(
-                    item
-                    in (
-                        anchor_text
-                        + " "
-                        + href
-                    ).lower()
-                    for item in TENDERISH_TERMS
-                ):
-                    detail_url = href
-
-            results.append(
-                TenderCandidate(
-                    portal=portal.portal,
-                    state=portal.state,
-                    source_url=final_url,
-                    tender_id=tender_id,
-                    organization=portal.portal,
-                    title=title[:500],
-                    category=infer_category(
-                        title
-                    ),
-                    detail_url=detail_url,
-                    discovered_doc_urls=list(
-                        dict.fromkeys(
-                            documents
-                        )
-                    ),
-                    keyword_hits=hits,
-                )
+            return (
+                page_results,
+                list(
+                    dict.fromkeys(
+                        next_urls
+                    )
+                ),
             )
+
+        results = []
+        visited_pages = set()
+        queued_pages = [first_url]
+        html_cache = {
+            first_url: first_html
+        }
+
+        page_no = 0
+        no_new_streak = 0
+        seen_tender_keys = set()
+
+        while (
+            queued_pages
+            and
+            page_no < MAX_PAGES_PER_PORTAL
+        ):
+            current_url = queued_pages.pop(0)
+
+            if current_url in visited_pages:
+                continue
+
+            visited_pages.add(
+                current_url
+            )
+
+            try:
+                if current_url in html_cache:
+                    html = html_cache.pop(
+                        current_url
+                    )
+                else:
+                    response = self.http.get(
+                        current_url,
+                        timeout=REQUEST_TIMEOUT,
+                        allow_redirects=True,
+                    )
+
+                    if response.status_code != 200:
+                        continue
+
+                    html = response.text
+
+            except requests.RequestException:
+                continue
+
+            page_no += 1
+
+            page_results, next_urls = parse_page(
+                html,
+                current_url,
+            )
+
+            new_count = 0
+
+            for tender in page_results:
+                key = tender.stable_key()
+
+                if key in seen_tender_keys:
+                    continue
+
+                seen_tender_keys.add(
+                    key
+                )
+                results.append(
+                    tender
+                )
+                new_count += 1
+
+            log.info(
+                "%s | GePNIC page %d | %d new matching tenders | total %d",
+                portal.portal,
+                page_no,
+                new_count,
+                len(results),
+            )
+
+            if new_count == 0:
+                no_new_streak += 1
+            else:
+                no_new_streak = 0
+
+            # Stop if multiple pages in a row add nothing.
+            if no_new_streak >= 3:
+                break
+
+            for next_url in next_urls:
+                if (
+                    next_url not in visited_pages
+                    and
+                    next_url not in queued_pages
+                ):
+                    queued_pages.append(
+                        next_url
+                    )
+
+        log.info(
+            "%s | GePNIC pagination complete | pages=%d | tenders=%d",
+            portal.portal,
+            page_no,
+            len(results),
+        )
 
         return self._dedupe(
             results
@@ -1525,99 +1718,187 @@ class TenderCrawler:
         self,
         portal,
     ):
-        response = self.http.get(
+        """
+        Crawl generic tender websites with best-effort pagination.
+
+        We follow:
+        - explicit Next links
+        - common numbered page links
+        - tender/procurement listing links
+
+        We still avoid unlimited crawling.
+        """
+
+        first_response = self.http.get(
             portal.url,
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
         )
 
-        response.raise_for_status()
+        first_response.raise_for_status()
 
-        lower_page = response.text.lower()
+        lower_page = first_response.text.lower()
 
         if (
             "captcha" in lower_page
             and
-            len(response.text) < 50000
+            len(first_response.text) < 50000
         ):
             raise RuntimeError(
                 "CAPTCHA_OR_LOGIN_REQUIRED"
             )
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
+        queue = [
+            first_response.url
+        ]
 
-        links = []
+        html_cache = {
+            first_response.url:
+                first_response.text
+        }
 
-        for anchor in soup.find_all(
-            "a",
-            href=True,
+        visited = set()
+        results = []
+        seen_tender_keys = set()
+
+        page_no = 0
+        no_new_streak = 0
+
+        while (
+            queue
+            and
+            page_no < MAX_GENERIC_PAGES
         ):
-            label = normalize_space(
-                anchor.get_text(
-                    " ",
-                    strip=True,
-                )
+            page_url = queue.pop(0)
+
+            if page_url in visited:
+                continue
+
+            visited.add(
+                page_url
             )
 
-            href = safe_urljoin(
-                response.url,
-                anchor.get(
-                    "href"
-                ),
+            try:
+                if page_url in html_cache:
+                    html = html_cache.pop(
+                        page_url
+                    )
+                else:
+                    response = self.http.get(
+                        page_url,
+                        timeout=REQUEST_TIMEOUT,
+                        allow_redirects=True,
+                    )
+
+                    if response.status_code != 200:
+                        continue
+
+                    html = response.text
+
+            except requests.RequestException:
+                continue
+
+            page_no += 1
+
+            soup = BeautifulSoup(
+                html,
+                "html.parser",
             )
 
-            combined = (
-                label
-                + " "
-                + href
-            ).lower()
+            links = []
+            pagination_links = []
 
-            if any(
-                term in combined
-                for term in TENDERISH_TERMS
+            for anchor in soup.find_all(
+                "a",
+                href=True,
             ):
-                links.append(
-                    (
-                        label,
-                        href,
+                label = normalize_space(
+                    anchor.get_text(
+                        " ",
+                        strip=True,
                     )
                 )
 
-        links = list(
-            dict.fromkeys(
-                links
-            )
-        )
-
-        results = []
-
-        for (
-            label,
-            href,
-        ) in links[:MAX_GENERIC_LINKS]:
-
-            if is_downloadable_url(
-                href
-            ):
-                hits = keyword_hits(
-                    label
+                href = safe_urljoin(
+                    page_url,
+                    anchor.get(
+                        "href"
+                    ),
                 )
+
+                if not href:
+                    continue
+
+                combined = (
+                    label
+                    + " "
+                    + href
+                ).lower()
+
+                if any(
+                    term in combined
+                    for term in TENDERISH_TERMS
+                ):
+                    links.append(
+                        (
+                            label,
+                            href,
+                        )
+                    )
+
+                label_lower = label.lower()
 
                 if (
-                    hits
-                    and
-                    valid_tender_title(
-                        label
+                    label_lower in {
+                        "next",
+                        "next >",
+                        "next »",
+                        ">",
+                        "»",
+                    }
+                    or
+                    "next" in label_lower
+                    or
+                    re.fullmatch(
+                        r"\d+",
+                        label_lower or "",
                     )
                 ):
-                    results.append(
-                        TenderCandidate(
+                    pagination_links.append(
+                        href
+                    )
+
+            links = list(
+                dict.fromkeys(
+                    links
+                )
+            )
+
+            new_count = 0
+
+            for (
+                label,
+                href,
+            ) in links[:MAX_GENERIC_LINKS]:
+
+                if is_downloadable_url(
+                    href
+                ):
+                    hits = keyword_hits(
+                        label
+                    )
+
+                    if (
+                        hits
+                        and
+                        valid_tender_title(
+                            label
+                        )
+                    ):
+                        tender = TenderCandidate(
                             portal=portal.portal,
                             state=portal.state,
-                            source_url=response.url,
+                            source_url=page_url,
                             organization=portal.portal,
                             title=label[:500],
                             category=infer_category(
@@ -1629,94 +1910,105 @@ class TenderCrawler:
                             ],
                             keyword_hits=hits,
                         )
-                    )
 
-                continue
+                        key = tender.stable_key()
 
-            try:
-                child_response = self.http.get(
-                    href,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
-                )
-
-                if child_response.status_code != 200:
-                    continue
-
-                child = BeautifulSoup(
-                    child_response.text,
-                    "html.parser",
-                )
-
-                text = normalize_space(
-                    child.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                hits = keyword_hits(
-                    label
-                )
-
-                if not hits:
-                    continue
-
-                title = label
-
-                if not valid_tender_title(
-                    title
-                ):
-                    heading = child.find(
-                        [
-                            "h1",
-                            "h2",
-                            "h3",
-                        ]
-                    )
-
-                    if heading:
-                        title = normalize_space(
-                            heading.get_text(
-                                " ",
-                                strip=True,
+                        if key not in seen_tender_keys:
+                            seen_tender_keys.add(
+                                key
                             )
-                        )
+                            results.append(
+                                tender
+                            )
+                            new_count += 1
 
-                if not valid_tender_title(
-                    title
-                ):
                     continue
 
-                documents = []
-
-                for child_anchor in child.find_all(
-                    "a",
-                    href=True,
-                ):
-                    child_url = safe_urljoin(
-                        child_response.url,
-                        child_anchor.get(
-                            "href"
-                        ),
+                try:
+                    child_response = self.http.get(
+                        href,
+                        timeout=REQUEST_TIMEOUT,
+                        allow_redirects=True,
                     )
 
-                    if is_downloadable_url(
-                        child_url
+                    if child_response.status_code != 200:
+                        continue
+
+                    child = BeautifulSoup(
+                        child_response.text,
+                        "html.parser",
+                    )
+
+                    # Important: relevance comes from actual link/title,
+                    # not footer/menu text from the entire page.
+                    hits = keyword_hits(
+                        label
+                    )
+
+                    if not hits:
+                        continue
+
+                    title = label
+
+                    if not valid_tender_title(
+                        title
                     ):
-                        documents.append(
-                            child_url
+                        heading = child.find(
+                            [
+                                "h1",
+                                "h2",
+                                "h3",
+                            ]
                         )
 
-                refs = extract_ref_candidates(
-                    text
-                )
+                        if heading:
+                            title = normalize_space(
+                                heading.get_text(
+                                    " ",
+                                    strip=True,
+                                )
+                            )
 
-                results.append(
-                    TenderCandidate(
+                    if not valid_tender_title(
+                        title
+                    ):
+                        continue
+
+                    documents = []
+
+                    for child_anchor in child.find_all(
+                        "a",
+                        href=True,
+                    ):
+                        child_url = safe_urljoin(
+                            child_response.url,
+                            child_anchor.get(
+                                "href"
+                            ),
+                        )
+
+                        if is_downloadable_url(
+                            child_url
+                        ):
+                            documents.append(
+                                child_url
+                            )
+
+                    child_text = normalize_space(
+                        child.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+
+                    refs = extract_ref_candidates(
+                        child_text
+                    )
+
+                    tender = TenderCandidate(
                         portal=portal.portal,
                         state=portal.state,
-                        source_url=response.url,
+                        source_url=page_url,
                         tender_id=(
                             refs[0]
                             if refs
@@ -1735,10 +2027,57 @@ class TenderCrawler:
                         )[:MAX_DOCUMENTS_PER_TENDER],
                         keyword_hits=hits,
                     )
-                )
 
-            except requests.RequestException:
-                continue
+                    key = tender.stable_key()
+
+                    if key not in seen_tender_keys:
+                        seen_tender_keys.add(
+                            key
+                        )
+                        results.append(
+                            tender
+                        )
+                        new_count += 1
+
+                except requests.RequestException:
+                    continue
+
+            log.info(
+                "%s | generic page %d | %d new matching tenders | total %d",
+                portal.portal,
+                page_no,
+                new_count,
+                len(results),
+            )
+
+            if new_count == 0:
+                no_new_streak += 1
+            else:
+                no_new_streak = 0
+
+            if no_new_streak >= 3:
+                break
+
+            for next_url in list(
+                dict.fromkeys(
+                    pagination_links
+                )
+            ):
+                if (
+                    next_url not in visited
+                    and
+                    next_url not in queue
+                ):
+                    queue.append(
+                        next_url
+                    )
+
+        log.info(
+            "%s | generic pagination complete | pages=%d | tenders=%d",
+            portal.portal,
+            page_no,
+            len(results),
+        )
 
         return self._dedupe(
             results
@@ -1774,13 +2113,13 @@ class TenderCrawler:
 
 def crawl_gem():
     """
-    Crawl the live GeM GTE listing surface.
+    Crawl the live GeM GTE listing surface with pagination.
 
-    Important:
-    - The default host is https://bidplus-global.gem.gov.in/
-    - We do NOT fabricate showbidDocument URLs from the numeric bid id.
-    - We capture real hrefs rendered on the page whenever possible.
-    - GeM UI can change, so failures are recorded in Portal_Directory.
+    For each event-related search term:
+    - search
+    - parse visible bids
+    - capture real hrefs
+    - click/follow Next until exhausted or max pages reached
     """
 
     if sync_playwright is None:
@@ -1844,7 +2183,9 @@ def crawl_gem():
                 wait_until="domcontentloaded",
             )
 
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(
+                3000
+            )
 
             search_ui_found = False
 
@@ -1877,133 +2218,282 @@ def crawl_gem():
 
                 try:
                     search_input.fill("")
-                    search_input.fill(term)
-                    page.keyboard.press("Enter")
-                    page.wait_for_timeout(2500)
-
-                    body_text = page.locator(
-                        "body"
-                    ).inner_text()
-
-                    bid_numbers = list(
-                        dict.fromkeys(
-                            re.findall(
-                                r"GEM/\d{4}/B/\d+",
-                                body_text,
-                            )
-                        )
+                    search_input.fill(
+                        term
+                    )
+                    page.keyboard.press(
+                        "Enter"
                     )
 
-                    # Capture real links from the rendered page.
-                    anchors = page.locator(
-                        "a[href]"
+                    page.wait_for_timeout(
+                        2500
                     )
 
-                    hrefs = []
+                    seen_page_signatures = set()
+                    seen_bid_ids = set()
 
-                    for index in range(
-                        min(
-                            anchors.count(),
-                            1500,
-                        )
+                    for page_number in range(
+                        1,
+                        MAX_GEM_PAGES_PER_SEARCH + 1,
                     ):
-                        try:
-                            href = anchors.nth(
-                                index
-                            ).get_attribute(
-                                "href"
-                            )
+                        body_text = page.locator(
+                            "body"
+                        ).inner_text()
 
-                            label = normalize_space(
-                                anchors.nth(
+                        bid_numbers = list(
+                            dict.fromkeys(
+                                re.findall(
+                                    r"GEM/\d{4}/B/\d+",
+                                    body_text,
+                                )
+                            )
+                        )
+
+                        signature = hashlib.sha256(
+                            (
+                                "|".join(
+                                    bid_numbers
+                                )
+                                + "|"
+                                + page.url
+                            ).encode(
+                                "utf-8"
+                            )
+                        ).hexdigest()
+
+                        if signature in seen_page_signatures:
+                            log.info(
+                                "GeM | %s | repeated page detected; stopping.",
+                                term,
+                            )
+                            break
+
+                        seen_page_signatures.add(
+                            signature
+                        )
+
+                        anchors = page.locator(
+                            "a[href]"
+                        )
+
+                        hrefs = []
+
+                        for index in range(
+                            min(
+                                anchors.count(),
+                                1500,
+                            )
+                        ):
+                            try:
+                                anchor = anchors.nth(
                                     index
-                                ).inner_text()
-                            )
+                                )
 
-                            if not href:
+                                href = anchor.get_attribute(
+                                    "href"
+                                )
+
+                                if not href:
+                                    continue
+
+                                label = normalize_space(
+                                    anchor.inner_text()
+                                )
+
+                                absolute = safe_urljoin(
+                                    page.url,
+                                    href,
+                                )
+
+                                combined = (
+                                    f"{label} {absolute}"
+                                ).lower()
+
+                                if (
+                                    "showbiddocument" in combined
+                                    or
+                                    "bidplus" in combined
+                                    or
+                                    "gem/" in combined
+                                ):
+                                    hrefs.append(
+                                        (
+                                            label,
+                                            absolute,
+                                        )
+                                    )
+
+                            except Exception:
                                 continue
 
-                            absolute = safe_urljoin(
-                                page.url,
-                                href,
+                        new_count = 0
+
+                        for bid_no in bid_numbers:
+                            if bid_no in seen_bid_ids:
+                                continue
+
+                            seen_bid_ids.add(
+                                bid_no
                             )
 
-                            combined = (
-                                f"{label} {absolute}"
-                            ).lower()
+                            numeric_bid = bid_no.split(
+                                "/"
+                            )[-1]
+
+                            matching_urls = []
+
+                            for label, href in hrefs:
+                                combined = (
+                                    f"{label} {href}"
+                                ).lower()
+
+                                if (
+                                    bid_no.lower()
+                                    in combined
+                                    or
+                                    numeric_bid
+                                    in combined
+                                ):
+                                    matching_urls.append(
+                                        href
+                                    )
+
+                            real_url = (
+                                matching_urls[0]
+                                if matching_urls
+                                else page.url
+                            )
+
+                            results.append(
+                                TenderCandidate(
+                                    portal=(
+                                        "Government "
+                                        "e-Marketplace (GeM)"
+                                    ),
+                                    state="Pan India",
+                                    source_url=GEM_LISTING_URL,
+                                    tender_id=bid_no,
+                                    organization="NOT VERIFIED",
+                                    title=(
+                                        f"{term} | "
+                                        f"{bid_no}"
+                                    ),
+                                    category=infer_category(
+                                        term
+                                    ),
+                                    detail_url=real_url,
+                                    discovered_doc_urls=(
+                                        matching_urls[:5]
+                                        if matching_urls
+                                        else []
+                                    ),
+                                    keyword_hits=[
+                                        term
+                                    ],
+                                )
+                            )
+
+                            new_count += 1
+
+                        log.info(
+                            "GeM | %s | page %d | %d new bids | total for search %d",
+                            term,
+                            page_number,
+                            new_count,
+                            len(
+                                seen_bid_ids
+                            ),
+                        )
+
+                        # Try common Next selectors.
+                        next_locator = None
+
+                        next_selectors = [
+                            'a:has-text("Next")',
+                            'button:has-text("Next")',
+                            'li.next a',
+                            'a[aria-label*="Next" i]',
+                            'button[aria-label*="Next" i]',
+                            'a[rel="next"]',
+                        ]
+
+                        for selector in next_selectors:
+                            locator = page.locator(
+                                selector
+                            ).first
+
+                            try:
+                                if (
+                                    locator.count()
+                                    and
+                                    locator.is_visible()
+                                ):
+                                    disabled = (
+                                        locator.get_attribute(
+                                            "disabled"
+                                        )
+                                        is not None
+                                    )
+
+                                    aria_disabled = (
+                                        (
+                                            locator.get_attribute(
+                                                "aria-disabled"
+                                            )
+                                            or ""
+                                        ).lower()
+                                        ==
+                                        "true"
+                                    )
+
+                                    classes = (
+                                        locator.get_attribute(
+                                            "class"
+                                        )
+                                        or ""
+                                    ).lower()
+
+                                    if (
+                                        disabled
+                                        or aria_disabled
+                                        or "disabled" in classes
+                                    ):
+                                        continue
+
+                                    next_locator = locator
+                                    break
+
+                            except Exception:
+                                continue
+
+                        if next_locator is None:
+                            break
+
+                        before_url = page.url
+                        before_text = body_text[:3000]
+
+                        try:
+                            next_locator.click(
+                                timeout=10000
+                            )
+
+                            page.wait_for_timeout(
+                                2000
+                            )
+
+                            after_text = page.locator(
+                                "body"
+                            ).inner_text()[:3000]
 
                             if (
-                                "showbiddocument" in combined
-                                or
-                                "bidplus" in combined
-                                or
-                                "gem/" in combined
+                                page.url == before_url
+                                and
+                                after_text == before_text
                             ):
-                                hrefs.append(
-                                    (
-                                        label,
-                                        absolute,
-                                    )
-                                )
+                                break
 
                         except Exception:
-                            continue
-
-                    # Map bid ids to the most relevant real href, if present.
-                    for bid_no in bid_numbers:
-                        numeric_bid = bid_no.split(
-                            "/"
-                        )[-1]
-
-                        matching_urls = []
-
-                        for label, href in hrefs:
-                            combined = (
-                                f"{label} {href}"
-                            ).lower()
-
-                            if (
-                                bid_no.lower()
-                                in combined
-                                or
-                                numeric_bid
-                                in combined
-                            ):
-                                matching_urls.append(
-                                    href
-                                )
-
-                        real_url = (
-                            matching_urls[0]
-                            if matching_urls
-                            else page.url
-                        )
-
-                        results.append(
-                            TenderCandidate(
-                                portal=(
-                                    "Government "
-                                    "e-Marketplace (GeM)"
-                                ),
-                                state="Pan India",
-                                source_url=GEM_LISTING_URL,
-                                tender_id=bid_no,
-                                organization="NOT VERIFIED",
-                                title=f"{term} | {bid_no}",
-                                category=infer_category(
-                                    term
-                                ),
-                                detail_url=real_url,
-                                discovered_doc_urls=(
-                                    matching_urls[:5]
-                                    if matching_urls
-                                    else []
-                                ),
-                                keyword_hits=[
-                                    term
-                                ],
-                            )
-                        )
+                            break
 
                 except Exception as error:
                     log.warning(
