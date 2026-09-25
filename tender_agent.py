@@ -5,13 +5,18 @@ import time
 import datetime
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from google import genai
 from google.oauth2 import service_account
 import gspread
 from playwright.sync_api import sync_playwright
+
+# Optional import for Excel parsing
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 # ==============================================================================
 # 1. VERIFIED SOUL EVENTS & CONSULTANCY AUDITED BENCHMARKS
@@ -49,9 +54,9 @@ EXCEL_MASTER_FILE = "Pan_India_Tender_URL_Master.xlsx"
 # ==============================================================================
 def load_url_master():
     """Loads all 109 active URLs from Excel file or falls back to built-in registry."""
-    if os.path.exists(EXCEL_MASTER_FILE):
+    if pd and os.path.exists(EXCEL_MASTER_FILE):
         try:
-            print(f"Loading master endpoints dynamically from '{EXCEL_MASTER_FILE}'...")
+            print(f"Reading master endpoints from '{EXCEL_MASTER_FILE}'...")
             df = pd.read_excel(EXCEL_MASTER_FILE, sheet_name="Tender URL Master", skiprows=2)
             active_df = df[df["Active"].astype(str).str.strip().str.lower() == "yes"]
             urls = []
@@ -63,12 +68,12 @@ def load_url_master():
                     "url": str(row.get("URL", "")).strip(),
                     "priority": str(row.get("Priority", "P2")).strip().upper()
                 })
-            print(f"Successfully loaded {len(urls)} active portals from Excel.")
+            print(f"Loaded {len(urls)} active portals from Excel.")
             return urls
         except Exception as e:
-            print(f"Notice reading Excel file: {e}. Falling back to internal registry.")
+            print(f"Excel read notice: {e}. Using internal registry.")
 
-    # Embedded registry of the 109 portals from the master list
+    # Embedded fallback covering Pan-India P1 & P2 portals
     return [
         {"category": "National/Central", "state": "Pan India", "portal": "GeM BidPlus", "url": "https://bidplus.gem.gov.in/all-bids", "priority": "P1"},
         {"category": "National/Central", "state": "Pan India", "portal": "CPPP Central", "url": "https://eprocure.gov.in/eprocure/app", "priority": "P1"},
@@ -102,8 +107,7 @@ def load_url_master():
         {"category": "PSU", "state": "Pan India", "portal": "BHEL eProcurement", "url": "https://eprocurebhel.co.in/nicgep/app", "priority": "P2"},
         {"category": "Metro/Transport", "state": "Maharashtra", "portal": "MMRDA Mumbai", "url": "https://mmrda.maharashtra.gov.in", "priority": "P2"},
         {"category": "Third Party Aggregator", "state": "Pan India", "portal": "BidAssist", "url": "https://bidassist.com", "priority": "P3"},
-        {"category": "Third Party Aggregator", "state": "Pan India", "portal": "Tender247", "url": "https://www.tender247.com", "priority": "P3"},
-        {"category": "Third Party Aggregator", "state": "Pan India", "portal": "TenderDetail", "url": "https://www.tenderdetail.com", "priority": "P3"}
+        {"category": "Third Party Aggregator", "state": "Pan India", "portal": "Tender247", "url": "https://www.tender247.com", "priority": "P3"}
     ]
 
 # ==============================================================================
@@ -183,7 +187,7 @@ def crawl_gepnic_endpoint(portal_meta):
     }
 
     try:
-        resp = requests.get(feed_url, headers=headers, timeout=12)
+        resp = requests.get(feed_url, headers=headers, timeout=10)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             rows = soup.find_all("tr")
@@ -226,10 +230,10 @@ def crawl_gem_live(page):
     gem_bids = []
     print("Crawling Live GeM BidPlus Portal...")
     try:
-        page.goto("https://bidplus.gem.gov.in/all-bids", timeout=45000, wait_until="domcontentloaded")
+        page.goto("https://bidplus.gem.gov.in/all-bids", timeout=35000, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
-        for kw in ["Event Management", "Conferences", "Sound and Light"]:
+        for kw in ["Event Management", "Conferences"]:
             try:
                 search_input = page.locator('input#search_by').or_(page.locator('input[type="search"]')).or_(page.locator('input[placeholder*="Search"]')).first
                 if search_input.is_visible():
@@ -260,7 +264,7 @@ def crawl_gem_live(page):
                                 "tender_id": bid_no,
                                 "organization": dept,
                                 "title": title,
-                                "category": "Artist / Star Night" if "star" in kw.lower() else "Corporate Conclave / B2B",
+                                "category": "Corporate Conclave / B2B",
                                 "estimated_value": "Refer GeM Document",
                                 "emd": "MSME Exempted under GFR 170",
                                 "deadline": "Refer Document",
@@ -286,7 +290,7 @@ def crawl_aggregators_live():
     for kw in ["event-management", "exhibition"]:
         try:
             url = f"https://bidassist.com/all-tenders/search?keyword={kw}"
-            resp = requests.get(url, headers=headers, timeout=12)
+            resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 cards = soup.find_all("div", class_="tender-card") or soup.find_all("div", class_="search-card")
@@ -348,7 +352,7 @@ def run_pipeline():
 
     # 1. Parallel Crawl for GePNIC Central, State & PSU Endpoints
     print("Executing parallel extraction across GePNIC portals...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(crawl_gepnic_endpoint, portal) for portal in master_list]
         for f in as_completed(futures):
             res = f.result()
@@ -387,7 +391,7 @@ def run_pipeline():
             seen_in_batch.add(t_id)
 
     print(f"--------------------------------------------------")
-    print(f"Total Live Event Tenders Scraped Across 109 Sites: {len(live_tenders)}")
+    print(f"Total Live Event Tenders Scraped Across Sites: {len(live_tenders)}")
     print(f"New Unique Tenders to Evaluate: {len(unique_new_tenders)}")
     print(f"--------------------------------------------------")
 
