@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-ACTIVE-DEADLINE-FILTER-V8"
+CODE_VERSION = "2026-09-25-GTE-DATA-CORRECTION-V9"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -1063,6 +1063,7 @@ SERVICE_INFRA_EXCLUSIONS = [
 
 NON_SPECIFIC_TENDER_TITLES = [
     "latest advertising agency tenders",
+    "latest advertising agency services tenders",
     "latest audio visual tenders",
     "latest audio visual accessory tenders",
     "latest audio visual equipment tenders",
@@ -1327,6 +1328,9 @@ def is_event_service_candidate(candidate):
 
     if not title:
         return False, "blank title"
+
+    if "bidplus-global.gem.gov.in" in detail_url:
+        return False, "GeM GTE result is not a standard GeM service tender"
 
     if any(
         phrase in title
@@ -4379,15 +4383,17 @@ def crawl_gem():
 
         if fallback_results:
             return (
-                fallback_results,
+                [],
                 CrawlHealth(
                     "Government e-Marketplace (GeM)",
-                    GEM_GTE_URL,
-                    "FALLBACK_SUCCESS",
-                    len(fallback_results),
+                    GEM_LISTING_URL,
+                    "GEM_STANDARD_UNREACHABLE",
+                    0,
                     (
-                        "Primary GeM unavailable/empty; "
-                        "GTE fallback used."
+                        "Standard GeM BidPlus is unreachable from this runner. "
+                        f"GTE diagnostic search found {len(fallback_results)} result(s), "
+                        "but GTE is a different catalogue and is intentionally NOT written "
+                        "to Active_Tenders."
                     ),
                 ),
             )
@@ -4400,8 +4406,9 @@ def crawl_gem():
                 "GEM_STANDARD_UNREACHABLE",
                 0,
                 (
-                    "Primary GeM unavailable/empty and "
-                    "GTE fallback returned no matching bids."
+                    "Standard GeM BidPlus is unreachable from this runner. "
+                    "GTE was checked only as a connectivity diagnostic and returned no matches; "
+                    "GTE is not used as a substitute for standard GeM."
                 ),
             ),
         )
