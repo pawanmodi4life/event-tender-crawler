@@ -62,7 +62,7 @@ OPENAI_API_KEY = os.getenv(
 # Current cost-sensitive OpenAI API model.
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-5.6-luna",
+    "gpt-6-luna",
 )
 
 GEM_LISTING_URL = os.getenv(
@@ -1607,6 +1607,16 @@ class TenderCrawler:
 # =============================================================================
 
 def crawl_gem():
+    """
+    Crawl the live GeM GTE listing surface.
+
+    Important:
+    - The default host is https://bidplus-global.gem.gov.in/
+    - We do NOT fabricate showbidDocument URLs from the numeric bid id.
+    - We capture real hrefs rendered on the page whenever possible.
+    - GeM UI can change, so failures are recorded in Portal_Directory.
+    """
+
     if sync_playwright is None:
         return (
             [],
@@ -1668,9 +1678,7 @@ def crawl_gem():
                 wait_until="domcontentloaded",
             )
 
-            page.wait_for_timeout(
-                3000
-            )
+            page.wait_for_timeout(3000)
 
             search_ui_found = False
 
@@ -1704,32 +1712,105 @@ def crawl_gem():
                 try:
                     search_input.fill("")
                     search_input.fill(term)
-                    page.keyboard.press(
-                        "Enter"
-                    )
-
-                    page.wait_for_timeout(
-                        2500
-                    )
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(2500)
 
                     body_text = page.locator(
                         "body"
                     ).inner_text()
 
-                    bid_numbers = re.findall(
-                        r"GEM/\d{4}/B/\d+",
-                        body_text,
+                    bid_numbers = list(
+                        dict.fromkeys(
+                            re.findall(
+                                r"GEM/\d{4}/B/\d+",
+                                body_text,
+                            )
+                        )
                     )
 
+                    # Capture real links from the rendered page.
+                    anchors = page.locator(
+                        "a[href]"
+                    )
+
+                    hrefs = []
+
+                    for index in range(
+                        min(
+                            anchors.count(),
+                            1500,
+                        )
+                    ):
+                        try:
+                            href = anchors.nth(
+                                index
+                            ).get_attribute(
+                                "href"
+                            )
+
+                            label = normalize_space(
+                                anchors.nth(
+                                    index
+                                ).inner_text()
+                            )
+
+                            if not href:
+                                continue
+
+                            absolute = safe_urljoin(
+                                page.url,
+                                href,
+                            )
+
+                            combined = (
+                                f"{label} {absolute}"
+                            ).lower()
+
+                            if (
+                                "showbiddocument" in combined
+                                or
+                                "bidplus" in combined
+                                or
+                                "gem/" in combined
+                            ):
+                                hrefs.append(
+                                    (
+                                        label,
+                                        absolute,
+                                    )
+                                )
+
+                        except Exception:
+                            continue
+
+                    # Map bid ids to the most relevant real href, if present.
                     for bid_no in bid_numbers:
                         numeric_bid = bid_no.split(
                             "/"
                         )[-1]
 
-                        document_url = (
-                            "https://bidplus-global.gem.gov.in/"
-                            "showbidDocument/"
-                            f"{numeric_bid}"
+                        matching_urls = []
+
+                        for label, href in hrefs:
+                            combined = (
+                                f"{label} {href}"
+                            ).lower()
+
+                            if (
+                                bid_no.lower()
+                                in combined
+                                or
+                                numeric_bid
+                                in combined
+                            ):
+                                matching_urls.append(
+                                    href
+                                )
+
+                        real_url = (
+                            matching_urls[0]
+                            if matching_urls
+                            else page.url
                         )
 
                         results.append(
@@ -1746,10 +1827,12 @@ def crawl_gem():
                                 category=infer_category(
                                     term
                                 ),
-                                detail_url=document_url,
-                                discovered_doc_urls=[
-                                    document_url
-                                ],
+                                detail_url=real_url,
+                                discovered_doc_urls=(
+                                    matching_urls[:5]
+                                    if matching_urls
+                                    else []
+                                ),
                                 keyword_hits=[
                                     term
                                 ],
