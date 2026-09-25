@@ -9,7 +9,7 @@ import zipfile
 import datetime as dt
 import urllib.parse
 
-CODE_VERSION = "2026-09-25-DISCOVERY-FIX-V4"
+CODE_VERSION = "2026-09-25-DISCOVERY-FIX-V5"
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -1746,8 +1746,17 @@ class TenderCrawler:
                 CrawlHealth(
                     portal.portal,
                     portal.url,
-                    "SUCCESS",
+                    (
+                        "SUCCESS"
+                        if items
+                        else "NO_MATCHES"
+                    ),
                     len(items),
+                    (
+                        ""
+                        if items
+                        else "Portal was reached, but no matching tender candidates were discovered."
+                    ),
                 ),
             )
 
@@ -1892,34 +1901,37 @@ class TenderCrawler:
         portal,
     ):
         """
-        Crawl GePNIC/CPPP-style listings with pagination.
+        Crawl GePNIC/CPPP-style portals.
 
-        Strategy:
-        - load latest active tenders page
-        - parse current page
-        - discover/follow Next/page links
-        - stop on repeat page, disabled Next, no new records, or max pages
+        Important:
+        - Active Tender search pages often show a CAPTCHA before returning rows.
+        - The public portal home page usually exposes a Latest Tenders table.
+        - Therefore we crawl BOTH the active-tender endpoint and the public
+          home page, then follow real pagination/detail links where available.
         """
 
         base = portal.url.rstrip("/")
 
-        candidate_urls = []
+        seed_urls = []
 
+        # Exact URL from master file.
+        seed_urls.append(base)
+
+        # If master points directly to an /app endpoint, also try its root.
         if "/app" in base.lower():
-            separator = (
-                "&"
-                if "?" in base
-                else "?"
-            )
+            root_guess = base.split("/app", 1)[0]
+            seed_urls.append(root_guess)
 
-            candidate_urls.append(
+            separator = "&" if "?" in base else "?"
+            seed_urls.append(
                 base
                 + separator
                 + "page=FrontEndLatestActiveTenders"
                 + "&service=page"
             )
 
-        candidate_urls.extend([
+        # Common GePNIC layouts.
+        seed_urls.extend([
             (
                 f"{base}/nicgep/app"
                 "?page=FrontEndLatestActiveTenders"
@@ -1935,38 +1947,13 @@ class TenderCrawler:
                 "?page=FrontEndLatestActiveTenders"
                 "&service=page"
             ),
-            base,
         ])
 
-        first_html = ""
-        first_url = ""
-
-        for url in dict.fromkeys(
-            candidate_urls
-        ):
-            try:
-                response = self.http.get(
-                    url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
-                )
-
-                if (
-                    response.status_code == 200
-                    and
-                    len(response.text) > 500
-                ):
-                    first_html = response.text
-                    first_url = response.url
-                    break
-
-            except requests.RequestException:
-                continue
-
-        if not first_html:
-            raise RuntimeError(
-                "No usable GePNIC page returned."
+        seed_urls = list(
+            dict.fromkeys(
+                seed_urls
             )
+        )
 
         def parse_page(
             html,
@@ -1978,6 +1965,7 @@ class TenderCrawler:
             )
 
             page_results = []
+            next_urls = []
 
             for row in soup.find_all(
                 "tr"
@@ -1988,6 +1976,9 @@ class TenderCrawler:
                         strip=True,
                     )
                 )
+
+                if not row_text:
+                    continue
 
                 hits = keyword_hits(
                     row_text
@@ -2008,35 +1999,76 @@ class TenderCrawler:
                     )
                 ]
 
-                if len(cells) < 2:
-                    continue
+                anchor_items = []
 
-                anchor_titles = [
-                    normalize_space(
-                        a.get_text(
+                for anchor in row.find_all(
+                    "a",
+                    href=True,
+                ):
+                    label = normalize_space(
+                        anchor.get_text(
                             " ",
                             strip=True,
                         )
                     )
-                    for a in row.find_all(
-                        "a"
+
+                    href = safe_urljoin(
+                        page_url,
+                        anchor.get(
+                            "href"
+                        ),
                     )
-                    if valid_tender_title(
-                        normalize_space(
-                            a.get_text(
-                                " ",
-                                strip=True,
+
+                    if (
+                        href
+                        and
+                        not href.lower().startswith(
+                            "javascript:"
+                        )
+                    ):
+                        anchor_items.append(
+                            (
+                                label,
+                                href,
                             )
+                        )
+
+                title_candidates = [
+                    cell
+                    for cell in cells
+                    if (
+                        valid_tender_title(
+                            cell
+                        )
+                        and
+                        keyword_hits(
+                            cell
                         )
                     )
                 ]
 
-                if anchor_titles:
+                title_candidates.extend([
+                    label
+                    for label, _ in anchor_items
+                    if (
+                        valid_tender_title(
+                            label
+                        )
+                        and
+                        keyword_hits(
+                            label
+                        )
+                    )
+                ])
+
+                if title_candidates:
                     title = max(
-                        anchor_titles,
+                        title_candidates,
                         key=len,
                     )
                 else:
+                    # If event wording exists only in the combined row,
+                    # retain the best non-generic cell.
                     usable_cells = [
                         cell
                         for cell in cells
@@ -2053,11 +2085,6 @@ class TenderCrawler:
                         key=len,
                     )
 
-                if not valid_tender_title(
-                    title
-                ):
-                    continue
-
                 refs = extract_ref_candidates(
                     row_text
                 )
@@ -2071,31 +2098,12 @@ class TenderCrawler:
                 detail_url = page_url
                 documents = []
 
-                for anchor in row.find_all(
-                    "a",
-                    href=True,
-                ):
-                    href = safe_urljoin(
-                        page_url,
-                        anchor.get(
-                            "href"
-                        ),
-                    )
-
-                    if not href:
-                        continue
-
-                    if href.lower().startswith(
-                        "javascript:"
-                    ):
-                        continue
-
-                    anchor_text = normalize_space(
-                        anchor.get_text(
-                            " ",
-                            strip=True,
-                        )
-                    )
+                for label, href in anchor_items:
+                    combined = (
+                        label
+                        + " "
+                        + href
+                    ).lower()
 
                     if is_downloadable_url(
                         href
@@ -2104,14 +2112,16 @@ class TenderCrawler:
                             href
                         )
 
-                    elif any(
-                        item
-                        in (
-                            anchor_text
-                            + " "
-                            + href
-                        ).lower()
-                        for item in TENDERISH_TERMS
+                    elif (
+                        "component=%24directlink"
+                        in href.lower()
+                        or
+                        any(
+                            term
+                            in combined
+                            for term
+                            in TENDERISH_TERMS
+                        )
                     ):
                         detail_url = href
 
@@ -2136,9 +2146,7 @@ class TenderCrawler:
                     )
                 )
 
-            # Pagination candidates: explicit Next plus numbered page links.
-            next_urls = []
-
+            # Follow pagination and direct tender-list pages.
             for anchor in soup.find_all(
                 "a",
                 href=True,
@@ -2148,7 +2156,7 @@ class TenderCrawler:
                         " ",
                         strip=True,
                     )
-                ).lower()
+                )
 
                 href = safe_urljoin(
                     page_url,
@@ -2157,16 +2165,20 @@ class TenderCrawler:
                     ),
                 )
 
-                if not href:
-                    continue
-
-                if href.lower().startswith(
-                    "javascript:"
+                if (
+                    not href
+                    or
+                    href.lower().startswith(
+                        "javascript:"
+                    )
                 ):
                     continue
 
+                label_lower = label.lower()
+                href_lower = href.lower()
+
                 if (
-                    label in {
+                    label_lower in {
                         "next",
                         "next >",
                         "next »",
@@ -2174,12 +2186,15 @@ class TenderCrawler:
                         "»",
                     }
                     or
-                    "next" in label
+                    "next" in label_lower
                     or
                     re.fullmatch(
                         r"\d+",
-                        label or "",
+                        label_lower or "",
                     )
+                    or
+                    "frontendlatestactivetenders"
+                    in href_lower
                 ):
                     next_urls.append(
                         href
@@ -2195,22 +2210,20 @@ class TenderCrawler:
             )
 
         results = []
+        seen_tender_keys = set()
         visited_pages = set()
-        queued_pages = [first_url]
-        html_cache = {
-            first_url: first_html
-        }
+        queue = list(
+            seed_urls
+        )
 
         page_no = 0
-        no_new_streak = 0
-        seen_tender_keys = set()
 
         while (
-            queued_pages
+            queue
             and
             page_no < MAX_PAGES_PER_PORTAL
         ):
-            current_url = queued_pages.pop(0)
+            current_url = queue.pop(0)
 
             if current_url in visited_pages:
                 continue
@@ -2220,21 +2233,18 @@ class TenderCrawler:
             )
 
             try:
-                if current_url in html_cache:
-                    html = html_cache.pop(
-                        current_url
-                    )
-                else:
-                    response = self.http.get(
-                        current_url,
-                        timeout=REQUEST_TIMEOUT,
-                        allow_redirects=True,
-                    )
+                response = self.http.get(
+                    current_url,
+                    timeout=REQUEST_TIMEOUT,
+                    allow_redirects=True,
+                )
 
-                    if response.status_code != 200:
-                        continue
-
-                    html = response.text
+                if (
+                    response.status_code != 200
+                    or
+                    len(response.text) < 300
+                ):
+                    continue
 
             except requests.RequestException:
                 continue
@@ -2242,8 +2252,8 @@ class TenderCrawler:
             page_no += 1
 
             page_results, next_urls = parse_page(
-                html,
-                current_url,
+                response.text,
+                response.url,
             )
 
             new_count = 0
@@ -2263,34 +2273,31 @@ class TenderCrawler:
                 new_count += 1
 
             log.info(
-                "%s | GePNIC page %d | %d new matching tenders | total %d",
+                "%s | GePNIC page %d | %d new matching tenders | total %d | %s",
                 portal.portal,
                 page_no,
                 new_count,
                 len(results),
+                response.url,
             )
-
-            if new_count == 0:
-                no_new_streak += 1
-            else:
-                no_new_streak = 0
-
-            # Stop if multiple pages in a row add nothing.
-            if no_new_streak >= 3:
-                break
 
             for next_url in next_urls:
                 if (
                     next_url not in visited_pages
                     and
-                    next_url not in queued_pages
+                    next_url not in queue
                 ):
-                    queued_pages.append(
+                    queue.append(
                         next_url
                     )
 
+        if page_no == 0:
+            raise RuntimeError(
+                "No usable GePNIC page returned."
+            )
+
         log.info(
-            "%s | GePNIC pagination complete | pages=%d | tenders=%d",
+            "%s | GePNIC crawl complete | pages=%d | tenders=%d",
             portal.portal,
             page_no,
             len(results),
@@ -2305,14 +2312,16 @@ class TenderCrawler:
         portal,
     ):
         """
-        Crawl generic tender websites with best-effort pagination.
+        Crawl generic tender websites by traversing tender/procurement
+        listing pages before treating links as individual tenders.
 
-        We follow:
-        - explicit Next links
-        - common numbered page links
-        - tender/procurement listing links
-
-        We still avoid unlimited crawling.
+        Previous versions only inspected the landing page and often mistook
+        a "Tenders" navigation link for a tender itself. This version:
+        - recursively queues tender/procurement listing pages
+        - parses event-related table rows/cards on every visited page
+        - follows pagination
+        - opens candidate detail pages only when the candidate itself is
+          event-relevant.
         """
 
         first_response = self.http.get(
@@ -2335,9 +2344,40 @@ class TenderCrawler:
         visited = set()
         results = []
         seen_tender_keys = set()
-
         page_no = 0
-        no_new_streak = 0
+
+        same_host = urllib.parse.urlsplit(
+            first_response.url
+        ).netloc.lower()
+
+        def enqueue(
+            url,
+        ):
+            if not url:
+                return
+
+            parsed = urllib.parse.urlsplit(
+                url
+            )
+
+            if (
+                parsed.netloc
+                and
+                parsed.netloc.lower()
+                != same_host
+            ):
+                return
+
+            if (
+                url not in visited
+                and
+                url not in queue
+                and
+                len(queue) < 500
+            ):
+                queue.append(
+                    url
+                )
 
         while (
             queue
@@ -2358,6 +2398,7 @@ class TenderCrawler:
                     html = html_cache.pop(
                         page_url
                     )
+                    response_url = page_url
                 else:
                     response = self.http.get(
                         page_url,
@@ -2369,6 +2410,7 @@ class TenderCrawler:
                         continue
 
                     html = response.text
+                    response_url = response.url
 
             except requests.RequestException:
                 continue
@@ -2380,8 +2422,156 @@ class TenderCrawler:
                 "html.parser",
             )
 
-            links = []
-            pagination_links = []
+            new_count = 0
+
+            # 1) Parse table rows as tender records.
+            for row in soup.find_all(
+                "tr"
+            ):
+                row_text = normalize_space(
+                    row.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+
+                hits = keyword_hits(
+                    row_text
+                )
+
+                if not hits:
+                    continue
+
+                anchor_items = []
+
+                for anchor in row.find_all(
+                    "a",
+                    href=True,
+                ):
+                    label = normalize_space(
+                        anchor.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+
+                    href = safe_urljoin(
+                        response_url,
+                        anchor.get(
+                            "href"
+                        ),
+                    )
+
+                    if href:
+                        anchor_items.append(
+                            (
+                                label,
+                                href,
+                            )
+                        )
+
+                cells = [
+                    normalize_space(
+                        td.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+                    for td in row.find_all(
+                        "td"
+                    )
+                ]
+
+                title_candidates = [
+                    cell
+                    for cell in cells
+                    if (
+                        valid_tender_title(
+                            cell
+                        )
+                        and
+                        keyword_hits(
+                            cell
+                        )
+                    )
+                ]
+
+                title_candidates.extend([
+                    label
+                    for label, _ in anchor_items
+                    if (
+                        valid_tender_title(
+                            label
+                        )
+                        and
+                        keyword_hits(
+                            label
+                        )
+                    )
+                ])
+
+                if not title_candidates:
+                    continue
+
+                title = max(
+                    title_candidates,
+                    key=len,
+                )
+
+                detail_url = response_url
+                documents = []
+
+                for label, href in anchor_items:
+                    if is_downloadable_url(
+                        href
+                    ):
+                        documents.append(
+                            href
+                        )
+                    else:
+                        detail_url = href
+
+                refs = extract_ref_candidates(
+                    row_text
+                )
+
+                candidate = TenderCandidate(
+                    portal=portal.portal,
+                    state=portal.state,
+                    source_url=response_url,
+                    tender_id=(
+                        refs[0]
+                        if refs
+                        else ""
+                    ),
+                    organization=portal.portal,
+                    title=title[:500],
+                    category=infer_category(
+                        title
+                    ),
+                    detail_url=detail_url,
+                    discovered_doc_urls=list(
+                        dict.fromkeys(
+                            documents
+                        )
+                    )[:MAX_DOCUMENTS_PER_TENDER],
+                    keyword_hits=hits,
+                )
+
+                key = candidate.stable_key()
+
+                if key not in seen_tender_keys:
+                    seen_tender_keys.add(
+                        key
+                    )
+                    results.append(
+                        candidate
+                    )
+                    new_count += 1
+
+            # 2) Traverse navigation/listing links and inspect likely
+            #    individual tender links.
+            candidate_links = []
 
             for anchor in soup.find_all(
                 "a",
@@ -2395,13 +2585,19 @@ class TenderCrawler:
                 )
 
                 href = safe_urljoin(
-                    page_url,
+                    response_url,
                     anchor.get(
                         "href"
                     ),
                 )
 
-                if not href:
+                if (
+                    not href
+                    or
+                    href.lower().startswith(
+                        "javascript:"
+                    )
+                ):
                     continue
 
                 combined = (
@@ -2410,20 +2606,9 @@ class TenderCrawler:
                     + href
                 ).lower()
 
-                if any(
-                    term in combined
-                    for term in TENDERISH_TERMS
-                ):
-                    links.append(
-                        (
-                            label,
-                            href,
-                        )
-                    )
-
                 label_lower = label.lower()
 
-                if (
+                is_pagination = (
                     label_lower in {
                         "next",
                         "next >",
@@ -2438,64 +2623,81 @@ class TenderCrawler:
                         r"\d+",
                         label_lower or "",
                     )
+                )
+
+                is_listing = any(
+                    term in combined
+                    for term in [
+                        "tender",
+                        "procurement",
+                        "eprocure",
+                        "e-tender",
+                        "etender",
+                        "rfp",
+                        "eoi",
+                        "bid",
+                        "notice inviting",
+                    ]
+                )
+
+                if (
+                    is_pagination
+                    or
+                    is_listing
                 ):
-                    pagination_links.append(
+                    enqueue(
                         href
                     )
 
-            links = list(
-                dict.fromkeys(
-                    links
-                )
-            )
+                if (
+                    keyword_hits(
+                        label
+                    )
+                    and
+                    valid_tender_title(
+                        label
+                    )
+                ):
+                    candidate_links.append(
+                        (
+                            label,
+                            href,
+                        )
+                    )
 
-            new_count = 0
-
-            for (
-                label,
-                href,
-            ) in links[:MAX_GENERIC_LINKS]:
-
+            # 3) Open event-looking detail links and extract metadata/docs.
+            for label, href in candidate_links[:MAX_GENERIC_LINKS]:
                 if is_downloadable_url(
                     href
                 ):
-                    hits = keyword_hits(
-                        label
+                    candidate = TenderCandidate(
+                        portal=portal.portal,
+                        state=portal.state,
+                        source_url=response_url,
+                        organization=portal.portal,
+                        title=label[:500],
+                        category=infer_category(
+                            label
+                        ),
+                        detail_url=href,
+                        discovered_doc_urls=[
+                            href
+                        ],
+                        keyword_hits=keyword_hits(
+                            label
+                        ),
                     )
 
-                    if (
-                        hits
-                        and
-                        valid_tender_title(
-                            label
-                        )
-                    ):
-                        tender = TenderCandidate(
-                            portal=portal.portal,
-                            state=portal.state,
-                            source_url=page_url,
-                            organization=portal.portal,
-                            title=label[:500],
-                            category=infer_category(
-                                label
-                            ),
-                            detail_url=href,
-                            discovered_doc_urls=[
-                                href
-                            ],
-                            keyword_hits=hits,
-                        )
+                    key = candidate.stable_key()
 
-                        key = tender.stable_key()
-
-                        if key not in seen_tender_keys:
-                            seen_tender_keys.add(
-                                key
-                            )
-                            results.append(
-                                tender
-                            )
-                            new_count += 1
+                    if key not in seen_tender_keys:
+                        seen_tender_keys.add(
+                            key
+                        )
+                        results.append(
+                            candidate
+                        )
+                        new_count += 1
 
                     continue
 
@@ -2514,56 +2716,52 @@ class TenderCrawler:
                         "html.parser",
                     )
 
-                    # Resolve the real child-page title before deciding relevance.
                     title = label
 
-                    heading = child.find(
-                        [
-                            "h1",
-                            "h2",
-                            "h3",
-                        ]
-                    )
-
-                    if heading:
-                        heading_title = normalize_space(
-                            heading.get_text(
-                                " ",
-                                strip=True,
-                            )
+                    for heading_name in [
+                        "h1",
+                        "h2",
+                        "h3",
+                    ]:
+                        heading = child.find(
+                            heading_name
                         )
 
-                        if valid_tender_title(
-                            heading_title
-                        ):
-                            title = heading_title
-
-                    if not valid_tender_title(
-                        title
-                    ):
-                        page_title = child.find(
-                            "title"
-                        )
-
-                        if page_title:
-                            title = normalize_space(
-                                page_title.get_text(
+                        if heading:
+                            heading_title = normalize_space(
+                                heading.get_text(
                                     " ",
                                     strip=True,
                                 )
                             )
 
-                    if not valid_tender_title(
+                            if (
+                                valid_tender_title(
+                                    heading_title
+                                )
+                                and
+                                keyword_hits(
+                                    heading_title
+                                )
+                            ):
+                                title = heading_title
+                                break
+
+                    if not keyword_hits(
                         title
                     ):
                         continue
 
-                    hits = keyword_hits(
-                        title
+                    child_text = normalize_space(
+                        child.get_text(
+                            " ",
+                            strip=True,
+                        )
                     )
 
-                    if not hits:
-                        continue
+                    refs = extract_ref_candidates(
+                        child_text
+                    )
 
                     documents = []
 
@@ -2585,21 +2783,10 @@ class TenderCrawler:
                                 child_url
                             )
 
-                    child_text = normalize_space(
-                        child.get_text(
-                            " ",
-                            strip=True,
-                        )
-                    )
-
-                    refs = extract_ref_candidates(
-                        child_text
-                    )
-
-                    tender = TenderCandidate(
+                    candidate = TenderCandidate(
                         portal=portal.portal,
                         state=portal.state,
-                        source_url=page_url,
+                        source_url=response_url,
                         tender_id=(
                             refs[0]
                             if refs
@@ -2616,17 +2803,19 @@ class TenderCrawler:
                                 documents
                             )
                         )[:MAX_DOCUMENTS_PER_TENDER],
-                        keyword_hits=hits,
+                        keyword_hits=keyword_hits(
+                            title
+                        ),
                     )
 
-                    key = tender.stable_key()
+                    key = candidate.stable_key()
 
                     if key not in seen_tender_keys:
                         seen_tender_keys.add(
                             key
                         )
                         results.append(
-                            tender
+                            candidate
                         )
                         new_count += 1
 
@@ -2634,37 +2823,16 @@ class TenderCrawler:
                     continue
 
             log.info(
-                "%s | generic page %d | %d new matching tenders | total %d",
+                "%s | generic page %d | %d new matching tenders | total %d | %s",
                 portal.portal,
                 page_no,
                 new_count,
                 len(results),
+                response_url,
             )
 
-            if new_count == 0:
-                no_new_streak += 1
-            else:
-                no_new_streak = 0
-
-            if no_new_streak >= 3:
-                break
-
-            for next_url in list(
-                dict.fromkeys(
-                    pagination_links
-                )
-            ):
-                if (
-                    next_url not in visited
-                    and
-                    next_url not in queue
-                ):
-                    queue.append(
-                        next_url
-                    )
-
         log.info(
-            "%s | generic pagination complete | pages=%d | tenders=%d",
+            "%s | generic crawl complete | pages=%d | tenders=%d",
             portal.portal,
             page_no,
             len(results),
