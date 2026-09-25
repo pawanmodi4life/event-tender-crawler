@@ -21,7 +21,7 @@ jobs:
       - name: Install Application Dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright gspread google-auth google-api-python-client google-genai requests beautifulsoup4 pandas openpyxl
+          pip install playwright gspread google-auth google-api-python-client google-genai requests beautifulsoup4 pandas openpyxl pypdf urllib3
           playwright install --with-deps chromium
 
       - name: Decrypt Credentials & Run Pipeline
