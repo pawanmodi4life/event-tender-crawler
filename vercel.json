@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/gem-test.js": {
+      "maxDuration": 30
+    },
+    "api/gem-search.js": {
+      "maxDuration": 60
+    }
+  }
+}
