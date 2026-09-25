@@ -13,14 +13,15 @@ jobs:
 
     timeout-minutes: 45
 
-    env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-      SERVICE_ACCOUNT_FILE: service_account.json
-      EXCEL_MASTER_FILE: Pan_India_Tender_URL_Master.xlsx
-      DOWNLOAD_DIR: tender_downloads
-      CRAWL_WORKERS: 10
-      REQUEST_TIMEOUT: 20
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_MODEL: gpt-6-astra
+  SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+  SERVICE_ACCOUNT_FILE: service_account.json
+  EXCEL_MASTER_FILE: Pan_India_Tender_URL_Master.xlsx
+  DOWNLOAD_DIR: tender_downloads
+  CRAWL_WORKERS: 10
+  REQUEST_TIMEOUT: 20
 
     steps:
       - name: Checkout repository
