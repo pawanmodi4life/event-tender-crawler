@@ -12,8 +12,13 @@ from google.oauth2 import service_account
 import gspread
 from playwright.sync_api import sync_playwright
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 # ==============================================================================
-# 1. VERIFIED SOUL EVENTS & CONSULTANCY AUDITED BENCHMARKS
+# 1. VERIFIED SOUL EVENTS & CONSULTANCY BENCHMARKS
 # ==============================================================================
 COMPANY_PROFILE = {
     "agency_name": "Soul Events and Consultancy",
@@ -31,19 +36,135 @@ COMPANY_PROFILE = {
     "max_three_works_threshold": 4628443       # Three works >= Rs. 46.28 Lakhs (NIA Foundation Day)
 }
 
+# Complete 59-Keyword Matrix for Pan-India Search
 EVENT_KEYWORDS = [
-    "event management", "star night", "celebrity artist", "conclave",
-    "exhibition", "light and sound", "german hangar", "stage fabrication",
-    "audio visual", "annual day", "cultural programme", "foundation day",
-    "summit", "conference", "pavilion", "stall fabrication"
+    "Event Management", "Event Agency", "Event Management Agency", "Exhibition", "Exhibition Stall",
+    "Exhibition Pavilion", "Design and Fabrication", "Fabrication", "Expo", "Trade Fair", "Mela",
+    "Festival", "Conference", "Seminar", "Convention", "Summit", "Conclave", "Roadshow",
+    "Dealer Meet", "Annual Day", "Foundation Day", "Award Ceremony", "Cultural Programme",
+    "Corporate Event", "Activation", "Brand Activation", "Experiential Marketing", "Publicity",
+    "Outreach Campaign", "IEC", "Media Campaign", "Advertising Agency", "Creative Agency",
+    "AV Production", "Audio Visual", "LED", "Sound Light", "Stage", "Tentage", "Decoration",
+    "Venue Management", "Hospitality", "Manpower", "Printing", "Branding", "Signage",
+    "Digital Marketing", "Social Media", "PR Agency", "Communication Agency",
+    "Empanelment of Event Agency", "Empanelment of Advertising Agency", "EOI Event", "RFP Event",
+    "Tourism Event", "Sports Event", "Government Function", "Launch Event", "Inauguration"
 ]
+
+EVENT_KEYWORDS_LOWER = [k.lower() for k in EVENT_KEYWORDS]
 
 SERVICE_ACCOUNT_FILE = "service_account.json"
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1YgsKZNiamaZ-E2ZZhIY2MLm8diC5okmeUMGFQdgQzHQ")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+EXCEL_MASTER_FILE = "Pan_India_Tender_URL_Master.xlsx"
 
 # ==============================================================================
-# 2. GEMINI AI STRICT PRE-QUALIFICATION ENGINE (FIXED MODEL ENDPOINTS)
+# 2. PAN-INDIA 109 SOURCES DIRECTORY BUILDER
+# ==============================================================================
+def load_and_sync_portal_directory(gc):
+    """
+    Creates/updates the 'Portal_Directory' tab in Google Sheets with the 10 requested columns:
+    Portal | Category | State | URL | Active | Last Crawl | Tender Count | Documents Accessible | Login/Captcha Required | Crawl Priority
+    """
+    print("Syncing Master Portal Directory (109 URLs) into Google Sheets...")
+    
+    # 1. Get or create Portal_Directory sheet tab
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        portal_sheet = spreadsheet.worksheet("Portal_Directory")
+    except gspread.WorksheetNotFound:
+        portal_sheet = spreadsheet.add_worksheet(title="Portal_Directory", rows="150", cols="12")
+        print("Created new worksheet tab: 'Portal_Directory'")
+
+    # Set Header row
+    headers = [
+        "Portal", "Category", "State", "URL", "Active",
+        "Last Crawl", "Tender Count", "Documents Accessible",
+        "Login/Captcha Required", "Crawl Priority"
+    ]
+    portal_sheet.update(values=[headers], range_name="A1:J1")
+
+    # 2. Extract sources from Excel or built-in registry
+    portals_list = []
+    if pd and os.path.exists(EXCEL_MASTER_FILE):
+        try:
+            df = pd.read_excel(EXCEL_MASTER_FILE, sheet_name="Tender URL Master", skiprows=2)
+            active_df = df[df["Active"].astype(str).str.strip().str.lower() == "yes"]
+            for _, r in active_df.iterrows():
+                u = str(r.get("URL", "")).strip()
+                cat = str(r.get("Category", "")).strip()
+                prio = str(r.get("Priority", "P2")).strip().upper()
+                src_type = str(r.get("Source Type", "")).strip()
+
+                # Determine document and captcha accessibility
+                if "gem.gov.in" in u.lower():
+                    doc_acc = "Yes (Direct Live PDF)"
+                    login_req = "No (Public BidPlus)"
+                elif any(k in u.lower() for k in ["nicgep", "eproc", "etender", "tenders"]):
+                    doc_acc = "Yes (Public View)"
+                    login_req = "No (Public NIT)"
+                elif src_type == "Discovery":
+                    doc_acc = "Yes (Aggregator)"
+                    login_req = "No (Public Index)"
+                else:
+                    doc_acc = "Varies (Org Website)"
+                    login_req = "May require Captcha"
+
+                portals_list.append({
+                    "portal": str(r.get("Portal / Organisation", "")).strip(),
+                    "category": cat,
+                    "state": str(r.get("State/Region", "")).strip(),
+                    "url": u,
+                    "active": "Yes",
+                    "doc_acc": doc_acc,
+                    "login_req": login_req,
+                    "priority": prio
+                })
+        except Exception as e:
+            print(f"Notice reading Excel: {e}")
+
+    # Built-in fallback if Excel reading encounters an issue
+    if not portals_list:
+        sample_sources = [
+            ("GeM BidPlus", "National/Central", "Pan India", "https://bidplus.gem.gov.in/all-bids", "P1", "Yes (Direct Live PDF)", "No (Public BidPlus)"),
+            ("CPPP Central", "National/Central", "Pan India", "https://eprocure.gov.in/eprocure/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Government e-Tenders", "National/Central", "Pan India", "https://www.etenders.gov.in/eprocure/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("MahaTenders", "State/UT", "Maharashtra", "https://mahatenders.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("UP eTenders", "State/UT", "Uttar Pradesh", "https://etender.up.nic.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Delhi eProcurement", "State/UT", "Delhi", "https://govtprocurement.delhi.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Rajasthan eProc", "State/UT", "Rajasthan", "https://eproc.rajasthan.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Odisha e-Tenders", "State/UT", "Odisha", "https://tendersodisha.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("MP e-Tenders", "State/UT", "Madhya Pradesh", "https://mptenders.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Karnataka KPPP", "State/UT", "Karnataka", "https://eproc.karnataka.gov.in", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("West Bengal e-Tenders", "State/UT", "West Bengal", "https://wbtenders.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Tamil Nadu e-Tenders", "State/UT", "Tamil Nadu", "https://tntenders.gov.in/nicgep/app", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Bihar eProcurement", "State/UT", "Bihar", "https://eproc2.bihar.gov.in", "P1", "Yes (Public View)", "No (Public NIT)"),
+            ("Coal India Tenders", "PSU", "Pan India", "https://coalindiatenders.nic.in/nicgep/app", "P2", "Yes (Public View)", "No (Public NIT)"),
+            ("IOCL Tenders", "PSU", "Pan India", "https://iocletenders.nic.in/nicgep/app", "P2", "Yes (Public View)", "No (Public NIT)"),
+            ("BidAssist", "Third Party Aggregator", "Pan India", "https://bidassist.com", "P3", "Yes (Aggregator)", "No (Public Index)")
+        ]
+        for p, c, s, u, pr, da, lr in sample_sources:
+            portals_list.append({
+                "portal": p, "category": c, "state": s, "url": u, "active": "Yes",
+                "doc_acc": da, "login_req": lr, "priority": pr
+            })
+
+    # Read existing rows to preserve or populate initial structure
+    existing_portal_rows = portal_sheet.get_all_values()
+    if len(existing_portal_rows) <= 1:
+        initial_data = []
+        for p in portals_list:
+            initial_data.append([
+                p["portal"], p["category"], p["state"], p["url"], p["active"],
+                "-", 0, p["doc_acc"], p["login_req"], p["priority"]
+            ])
+        portal_sheet.update(values=initial_data, range_name=f"A2:J{len(initial_data)+1}")
+        print(f"Populated {len(initial_data)} portals in Portal_Directory sheet.")
+
+    return portals_list, portal_sheet
+
+# ==============================================================================
+# 3. GEMINI AI PRE-QUALIFICATION ENGINE (STABLE 1.5-FLASH ENDPOINT)
 # ==============================================================================
 def evaluate_tender_strictly(tender: dict) -> dict:
     """Evaluates live tender data using verified stable Gemini models."""
@@ -84,7 +205,6 @@ def evaluate_tender_strictly(tender: dict) -> dict:
     {{"status": "QUALIFIED" | "DISQUALIFIED" | "NEEDS MANUAL INTERVENTION", "reasoning": "...", "action_plan": "..."}}
     """
     
-    # Try gemini-1.5-flash first, then gemini-2.0-flash fallback
     for model_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
         try:
             response = client.models.generate_content(
@@ -104,7 +224,7 @@ def evaluate_tender_strictly(tender: dict) -> dict:
     }
 
 # ==============================================================================
-# 3. PAN-INDIA REFINED WEB CRAWLERS (DEEP DIRECT DOCUMENT LINKS)
+# 4. PAN-INDIA LIVE SCRAPERS (DEEP DIRECT DOCUMENT URLS)
 # ==============================================================================
 def crawl_gepnic_endpoint(portal_meta):
     """Scrapes active published tenders from GePNIC/NIC central & state endpoints with direct links."""
@@ -131,25 +251,24 @@ def crawl_gepnic_endpoint(portal_meta):
             rows = soup.find_all("tr")
             for row in rows:
                 row_text = row.text.lower()
-                if any(kw in row_text for kw in EVENT_KEYWORDS):
+                # Check against all 59 event keywords
+                if any(kw in row_text for kw in EVENT_KEYWORDS_LOWER):
                     cols = row.find_all("td")
                     if len(cols) >= 5:
                         title_col = cols[4].text.strip()
                         dept_col = cols[5].text.strip() if len(cols) > 5 else f"{portal_name} ({state_name})"
                         closing_date = cols[2].text.strip()
 
-                        # Extract exact anchor link
                         link_elem = cols[4].find("a", href=True) or row.find("a", href=True)
                         tender_id_match = re.search(r"\d{4}_[A-Z0-9]+_\d+_\d+", title_col)
                         tender_id = tender_id_match.group(0) if tender_id_match else f"{portal_name[:3]}/{int(time.time())}"
 
-                        # Construct deep direct link instead of homepage
+                        # Direct Deep Link
                         if link_elem and link_elem["href"]:
                             raw_href = link_elem["href"]
                             if "javascript:" not in raw_href.lower():
                                 doc_url = urllib.parse.urljoin(base_url, raw_href)
                             else:
-                                # For javascript postback links, provide the direct search endpoint with tenderId query
                                 doc_url = f"{base_url}?page=FrontEndTenderDetailsExternal&service=page&tenderId={tender_id}"
                         else:
                             doc_url = f"{base_url}?page=FrontEndTenderDetailsExternal&service=page&tenderId={tender_id}"
@@ -176,12 +295,12 @@ def crawl_gepnic_endpoint(portal_meta):
 def crawl_gem_live(page):
     """Scrapes live bids from GeM BidPlus with direct document download URLs."""
     gem_bids = []
-    print("Crawling Live GeM BidPlus Portal...")
+    print("Crawling Live GeM BidPlus Portal across event categories...")
     try:
         page.goto("https://bidplus.gem.gov.in/all-bids", timeout=35000, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
-        for kw in ["Event Management", "Conferences"]:
+        for kw in ["Event Management", "Exhibition", "Conferences", "Sound and Light"]:
             try:
                 search_input = page.locator('input#search_by').or_(page.locator('input[type="search"]')).or_(page.locator('input[placeholder*="Search"]')).first
                 if search_input.is_visible():
@@ -196,14 +315,11 @@ def crawl_gem_live(page):
                         bid_match = re.search(r"GEM/\d{4}/B/\d+", card_text)
                         if bid_match:
                             bid_no = bid_match.group(0)
-                            
-                            # Construct direct GeM document link
                             doc_elem = card.locator("a[href*='showbidDocument'], a[href*='show-bid']").first
                             if doc_elem.count() > 0:
                                 href = doc_elem.get_attribute("href")
                                 doc_link = urllib.parse.urljoin("https://bidplus.gem.gov.in", href)
                             else:
-                                # Clean direct search link for that specific Bid ID
                                 doc_link = f"https://bidplus.gem.gov.in/showbidDocument/{bid_no.split('/')[-1]}"
 
                             lines = [l.strip() for l in card_text.split("\n") if l.strip()]
@@ -215,7 +331,7 @@ def crawl_gem_live(page):
                                 "tender_id": bid_no,
                                 "organization": dept,
                                 "title": title,
-                                "category": "Corporate Conclave / B2B",
+                                "category": "Artist / Star Night" if "star" in kw.lower() else "Corporate Conclave / B2B",
                                 "estimated_value": "Refer GeM Document",
                                 "emd": "MSME Exempted under GFR 170",
                                 "deadline": "Refer Document",
@@ -232,13 +348,13 @@ def crawl_gem_live(page):
 
 
 def crawl_aggregators_live():
-    """Scrapes Pan-India aggregators capturing exact tender detail page links."""
+    """Scrapes Pan-India aggregators capturing exact deep links for event tenders."""
     agg_results = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     }
 
-    for kw in ["event-management", "exhibition"]:
+    for kw in ["event-management", "exhibition", "conclave"]:
         try:
             url = f"https://bidassist.com/all-tenders/search?keyword={kw}"
             resp = requests.get(url, headers=headers, timeout=10)
@@ -251,12 +367,8 @@ def crawl_aggregators_live():
                     loc_elem = card.find("span", class_="location")
 
                     if title_elem:
-                        # Extract exact deep link to tender detail page
                         anchor = card.find("a", href=True)
-                        if anchor and anchor["href"]:
-                            doc_link = urllib.parse.urljoin("https://bidassist.com", anchor["href"])
-                        else:
-                            doc_link = url
+                        doc_link = urllib.parse.urljoin("https://bidassist.com", anchor["href"]) if anchor else url
 
                         agg_results.append({
                             "portal": "Pan-India Aggregator (BidAssist)",
@@ -277,78 +389,66 @@ def crawl_aggregators_live():
     return agg_results
 
 # ==============================================================================
-# 4. PAN-INDIA ENDPOINTS LIST (FROM MASTER REGISTRY)
+# 5. DEDUPLICATION, AUTO-CLEAN & SHEET EXECUTION
 # ==============================================================================
-MASTER_PORTALS = [
-    {"category": "National/Central", "state": "Pan India", "portal": "CPPP Central", "url": "https://eprocure.gov.in/eprocure/app"},
-    {"category": "National/Central", "state": "Pan India", "portal": "Government e-Tenders", "url": "https://www.etenders.gov.in/eprocure/app"},
-    {"category": "State/UT", "state": "Maharashtra", "portal": "MahaTenders", "url": "https://mahatenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Uttar Pradesh", "portal": "UP eTenders", "url": "https://etender.up.nic.in/nicgep/app"},
-    {"category": "State/UT", "state": "Delhi", "portal": "Delhi eProcurement", "url": "https://govtprocurement.delhi.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Rajasthan", "portal": "Rajasthan eProc", "url": "https://eproc.rajasthan.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Odisha", "portal": "Odisha e-Tenders", "url": "https://tendersodisha.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Madhya Pradesh", "portal": "MP e-Tenders", "url": "https://mptenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "West Bengal", "portal": "West Bengal e-Tenders", "url": "https://wbtenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Tamil Nadu", "portal": "Tamil Nadu e-Tenders", "url": "https://tntenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Haryana", "portal": "Haryana e-Tenders", "url": "https://etenders.hry.nic.in/nicgep/app"},
-    {"category": "State/UT", "state": "Punjab", "portal": "Punjab eProc", "url": "https://eproc.punjab.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Assam", "portal": "Assam e-Tenders", "url": "https://assamtenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Kerala", "portal": "Kerala e-Tenders", "url": "https://etenders.kerala.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Uttarakhand", "portal": "Uttarakhand e-Tenders", "url": "https://uktenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Himachal Pradesh", "portal": "HP e-Tenders", "url": "https://hptenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Jammu & Kashmir", "portal": "J&K e-Tenders", "url": "https://jktenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Jharkhand", "portal": "Jharkhand e-Tenders", "url": "https://jharkhandtenders.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Goa", "portal": "Goa eProcurement", "url": "https://eprocure.goa.gov.in/nicgep/app"},
-    {"category": "State/UT", "state": "Chandigarh", "portal": "Chandigarh e-Tenders", "url": "https://etenders.chd.nic.in/nicgep/app"},
-    {"category": "State/UT", "state": "Puducherry", "portal": "Puducherry e-Tenders", "url": "https://pudutenders.gov.in/nicgep/app"},
-    {"category": "Defence", "state": "Pan India", "portal": "Defence eProcurement", "url": "https://defproc.gov.in/nicgep/app"},
-    {"category": "PSU", "state": "Pan India", "portal": "Coal India Tenders", "url": "https://coalindiatenders.nic.in/nicgep/app"},
-    {"category": "PSU", "state": "Pan India", "portal": "IOCL Tenders", "url": "https://iocletenders.nic.in/nicgep/app"},
-    {"category": "PSU", "state": "Pan India", "portal": "BHEL eProcurement", "url": "https://eprocurebhel.co.in/nicgep/app"}
-]
-
-# ==============================================================================
-# 5. DEDUPLICATION & GOOGLE SHEET SYNC PIPELINE
-# ==============================================================================
-def get_google_sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID).worksheet("Active_Tenders")
-
-
-def get_existing_tender_ids(sheet):
-    """Retrieves existing tender IDs from Column B to prevent duplicate entries."""
+def purge_legacy_dummy_rows(sheet):
+    """Automatically cleans legacy sample mock rows from the sheet."""
     try:
-        col_b_values = sheet.col_values(2)
-        return set(col_b_values[1:])
-    except Exception:
-        return set()
+        rows = sheet.get_all_values()
+        if len(rows) > 1:
+            dummy_indicators = ["gem/2026/b/7891024", "cppp/2026/dpiit", "up/2026/tourism/4512", "rj/2026/sppp", "mh/2026/cidco/3321"]
+            for idx, r in enumerate(rows[1:], start=2):
+                tender_id = str(r[1]).lower()
+                if any(di in tender_id for di in dummy_indicators):
+                    sheet.delete_rows(idx)
+                    print(f"Purged legacy dummy test row: {r[1]}")
+    except Exception as e:
+        print(f"Notice during dummy row cleanup: {e}")
 
 
 def run_pipeline():
     today = datetime.date.today().strftime("%Y-%m-%d")
     print(f"==================================================")
-    print(f"Starting Pan-India Live Tender Crawler: {today}")
-    print(f"Mode: Real-Time Live Scraping & Verified Deep Links")
+    print(f"Starting Pan-India Live Tender Automation: {today}")
+    print(f"Keywords Configured: {len(EVENT_KEYWORDS)} event categories")
     print(f"==================================================")
 
-    sheet = get_google_sheet()
-    existing_ids = get_existing_tender_ids(sheet)
-    print(f"Existing tenders logged in sheet: {len(existing_ids)}")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    active_sheet = spreadsheet.worksheet("Active_Tenders")
+
+    # 1. Sync & Update Portal_Directory Tab (109 Master Sources)
+    master_portals, portal_sheet = load_and_sync_portal_directory(gc)
+
+    # 2. Purge Any Lingering Legacy Dummy Rows
+    purge_legacy_dummy_rows(active_sheet)
+
+    # 3. Read Existing Tender IDs (Avoid Duplicates)
+    try:
+        col_b_vals = active_sheet.col_values(2)
+        existing_ids = set(col_b_vals[1:])
+    except Exception:
+        existing_ids = set()
+    print(f"Existing verified tenders logged in sheet: {len(existing_ids)}")
 
     live_tenders = []
+    portal_counts = {}
 
-    # 1. Parallel Crawl for GePNIC Central & State Endpoints
+    # 4. Multi-threaded Parallel Crawl for GePNIC Endpoints
     print("Executing parallel extraction across GePNIC portals...")
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(crawl_gepnic_endpoint, portal) for portal in MASTER_PORTALS]
+        futures = {executor.submit(crawl_gepnic_endpoint, portal): portal for portal in master_portals}
         for f in as_completed(futures):
+            p_meta = futures[f]
             res = f.result()
+            count = len(res) if res else 0
+            portal_counts[p_meta["portal"]] = count
             if res:
                 live_tenders.extend(res)
 
-    # 2. Playwright Crawl for GeM BidPlus
+    # 5. Playwright Crawl for GeM BidPlus
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -361,16 +461,34 @@ def run_pipeline():
             page = context.new_page()
             gem_records = crawl_gem_live(page)
             live_tenders.extend(gem_records)
+            portal_counts["GeM BidPlus"] = len(gem_records)
             browser.close()
     except Exception as e:
         print(f"GeM crawler notice: {e}")
 
-    # 3. Pan-India Aggregator Crawl
+    # 6. Aggregator Feeds
     print("Querying Pan-India aggregator feeds...")
     agg_records = crawl_aggregators_live()
     live_tenders.extend(agg_records)
 
-    # 4. Deduplicate Against Existing Records in Google Sheet
+    # 7. Update Last Crawl Timestamp & Tender Count in Portal_Directory
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    try:
+        p_rows = portal_sheet.get_all_values()
+        updates = []
+        for row_idx, r in enumerate(p_rows[1:], start=2):
+            p_name = r[0]
+            if p_name in portal_counts:
+                # Update Col F (Last Crawl) and Col G (Tender Count)
+                updates.append({"range": f"F{row_idx}:G{row_idx}", "values": [[now_str, portal_counts[p_name]]]})
+        if updates:
+            for u in updates[:25]:  # Batch update top crawled portals
+                portal_sheet.update(range_name=u["range"], values=u["values"])
+        print("Updated crawl timestamps and live counts in 'Portal_Directory'.")
+    except Exception as e:
+        print(f"Notice updating Portal_Directory counts: {e}")
+
+    # 8. Deduplicate Live Tenders
     unique_new_tenders = []
     seen_in_batch = set()
     for t in live_tenders:
@@ -385,10 +503,10 @@ def run_pipeline():
     print(f"--------------------------------------------------")
 
     if not unique_new_tenders:
-        print(f"Zero new event tenders published across crawled portals today. Exiting cleanly without dummy data.")
+        print("Zero new event tenders published today. Exiting cleanly without dummy data.")
         return
 
-    # 5. Evaluate and Append Real Data Only
+    # 9. Evaluate & Append Real Tenders to Active_Tenders Tab
     for item in unique_new_tenders:
         print(f"Evaluating Tender [{item['tender_id']}]: {item['title'][:45]}...")
         decision = evaluate_tender_strictly(item)
@@ -412,10 +530,10 @@ def run_pipeline():
             remarks_field
         ]
 
-        sheet.append_row(row_data)
-        print(f"  -> Appended [{decision['status']}] to Sheet with link: {item['doc_link']}")
+        active_sheet.append_row(row_data)
+        print(f"  -> Appended [{decision['status']}] with direct link: {item['doc_link']}")
 
-    print(f"Pan-India crawl and evaluation finished successfully for {today}.")
+    print(f"Pipeline executed successfully for {today}.")
 
 if __name__ == "__main__":
     run_pipeline()
