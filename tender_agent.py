@@ -67,6 +67,11 @@ OPENAI_MODEL = os.getenv(
 
 GEM_LISTING_URL = os.getenv(
     "GEM_LISTING_URL",
+    "https://bidplus.gem.gov.in/all-bids",
+)
+
+GEM_GTE_URL = os.getenv(
+    "GEM_GTE_URL",
     "https://bidplus-global.gem.gov.in/",
 )
 
@@ -144,6 +149,15 @@ MAX_GENERIC_PAGES = int(
         "MAX_GENERIC_PAGES",
         "50",
     )
+)
+
+
+GENERIC_JS_FALLBACK = (
+    os.getenv(
+        "GENERIC_JS_FALLBACK",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "y"}
 )
 
 
@@ -910,6 +924,33 @@ def is_relevant_event_tender(candidate):
     # Do NOT use inferred category or full webpage text here.
     return is_relevant_event_title(
         candidate.title
+    )
+
+
+
+def extract_gem_bid_numbers(*chunks):
+    """
+    Extract public GeM bid numbers from rendered text or page HTML.
+    """
+    output = []
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        output.extend(
+            re.findall(
+                r"GEM/\d{4}/B/\d+",
+                chunk,
+                flags=re.I,
+            )
+        )
+
+    return list(
+        dict.fromkeys(
+            item.upper()
+            for item in output
+        )
     )
 
 
@@ -2079,9 +2120,289 @@ class TenderCrawler:
             len(results),
         )
 
+        output = self._dedupe(
+            results
+        )
+
+        if (
+            not output
+            and
+            GENERIC_JS_FALLBACK
+        ):
+            js_output = self.crawl_generic_playwright(
+                portal
+            )
+
+            if js_output:
+                log.info(
+                    "%s | JS fallback recovered %d event tenders.",
+                    portal.portal,
+                    len(js_output),
+                )
+
+                return js_output
+
+        return output
+
+    def crawl_generic_playwright(
+        self,
+        portal,
+    ):
+        """
+        Best-effort fallback for JavaScript-rendered tender listing pages.
+        It does not bypass CAPTCHA/login.
+        """
+
+        if (
+            sync_playwright is None
+            or
+            not GENERIC_JS_FALLBACK
+        ):
+            return []
+
+        results = []
+        seen = set()
+
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+
+                page = browser.new_page(
+                    viewport={
+                        "width": 1440,
+                        "height": 1000,
+                    }
+                )
+
+                page.goto(
+                    portal.url,
+                    timeout=45000,
+                    wait_until="domcontentloaded",
+                )
+
+                page.wait_for_timeout(
+                    2500
+                )
+
+                for page_no in range(
+                    1,
+                    min(
+                        MAX_GENERIC_PAGES,
+                        25,
+                    ) + 1,
+                ):
+                    body = page.locator(
+                        "body"
+                    ).inner_text()
+
+                    lower_body = body.lower()
+
+                    if (
+                        "captcha" in lower_body
+                        and
+                        len(body) < 100000
+                    ):
+                        break
+
+                    anchors = page.locator(
+                        "a[href]"
+                    )
+
+                    new_count = 0
+
+                    for index in range(
+                        min(
+                            anchors.count(),
+                            2500,
+                        )
+                    ):
+                        try:
+                            anchor = anchors.nth(
+                                index
+                            )
+
+                            label = normalize_space(
+                                anchor.inner_text()
+                            )
+
+                            if not valid_tender_title(
+                                label
+                            ):
+                                continue
+
+                            if not is_relevant_event_title(
+                                label
+                            ):
+                                continue
+
+                            href = anchor.get_attribute(
+                                "href"
+                            )
+
+                            if not href:
+                                continue
+
+                            detail_url = safe_urljoin(
+                                page.url,
+                                href,
+                            )
+
+                            tender = TenderCandidate(
+                                portal=portal.portal,
+                                state=portal.state,
+                                source_url=page.url,
+                                organization=portal.portal,
+                                title=label[:500],
+                                category=infer_category(
+                                    label
+                                ),
+                                detail_url=detail_url,
+                                discovered_doc_urls=(
+                                    [detail_url]
+                                    if is_downloadable_url(
+                                        detail_url
+                                    )
+                                    else []
+                                ),
+                                keyword_hits=keyword_hits(
+                                    label
+                                ),
+                            )
+
+                            key = tender.stable_key()
+
+                            if key in seen:
+                                continue
+
+                            seen.add(
+                                key
+                            )
+
+                            results.append(
+                                tender
+                            )
+
+                            new_count += 1
+
+                        except Exception:
+                            continue
+
+                    log.info(
+                        "%s | JS fallback page %d | %d new event tenders | total %d",
+                        portal.portal,
+                        page_no,
+                        new_count,
+                        len(results),
+                    )
+
+                    next_locator = None
+
+                    for selector in [
+                        'a:has-text("Next")',
+                        'button:has-text("Next")',
+                        'a[aria-label*="Next" i]',
+                        'button[aria-label*="Next" i]',
+                        'a[rel="next"]',
+                        'li.next a',
+                    ]:
+                        try:
+                            locator = page.locator(
+                                selector
+                            ).first
+
+                            if not (
+                                locator.count()
+                                and
+                                locator.is_visible()
+                            ):
+                                continue
+
+                            aria_disabled = (
+                                (
+                                    locator.get_attribute(
+                                        "aria-disabled"
+                                    )
+                                    or ""
+                                ).lower()
+                                ==
+                                "true"
+                            )
+
+                            classes = (
+                                locator.get_attribute(
+                                    "class"
+                                )
+                                or ""
+                            ).lower()
+
+                            if (
+                                aria_disabled
+                                or
+                                "disabled" in classes
+                            ):
+                                continue
+
+                            next_locator = locator
+                            break
+
+                        except Exception:
+                            continue
+
+                    if next_locator is None:
+                        break
+
+                    before = hashlib.sha256(
+                        body.encode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+                    ).hexdigest()
+
+                    try:
+                        next_locator.click(
+                            timeout=8000
+                        )
+
+                        page.wait_for_timeout(
+                            1800
+                        )
+
+                        after_body = page.locator(
+                            "body"
+                        ).inner_text()
+
+                        after = hashlib.sha256(
+                            after_body.encode(
+                                "utf-8",
+                                errors="ignore",
+                            )
+                        ).hexdigest()
+
+                        if after == before:
+                            break
+
+                    except Exception:
+                        break
+
+                browser.close()
+
+        except Exception as error:
+            log.info(
+                "%s | JS fallback failed: %s",
+                portal.portal,
+                str(error)[:220],
+            )
+
         return self._dedupe(
             results
         )
+
 
     def _dedupe(
         self,
@@ -2113,13 +2434,17 @@ class TenderCrawler:
 
 def crawl_gem():
     """
-    Crawl the live GeM GTE listing surface with pagination.
+    Crawl the standard public GeM bid listing:
+        https://bidplus.gem.gov.in/all-bids
 
-    For each event-related search term:
-    - search
-    - parse visible bids
-    - capture real hrefs
-    - click/follow Next until exhausted or max pages reached
+    This is intentionally separate from the GTE-only surface:
+        https://bidplus-global.gem.gov.in/
+
+    Strategy:
+    - search event-related keywords
+    - parse rendered text AND HTML
+    - capture real links instead of fabricating document paths
+    - follow Next pagination when available
     """
 
     if sync_playwright is None:
@@ -2136,8 +2461,10 @@ def crawl_gem():
 
     search_terms = [
         "Event Management",
+        "Event Agency",
         "Exhibition",
-        "Conference",
+        "Exhibition Stall",
+        "Conference Management",
         "Conclave",
         "Summit",
         "Mela",
@@ -2147,10 +2474,13 @@ def crawl_gem():
         "Brand Activation",
         "Audio Visual",
         "Sound and Light",
-        "Empanelment Event",
+        "Event Empanelment",
         "Outreach Campaign",
         "Experiential Marketing",
         "Foundation Day",
+        "Roadshow",
+        "Pavilion",
+        "Stall Fabrication",
     ]
 
     results = []
@@ -2172,27 +2502,34 @@ def crawl_gem():
                     "AppleWebKit/537.36 "
                     "(KHTML, like Gecko) "
                     "Chrome/128.0 Safari/537.36"
-                )
+                ),
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                },
             )
 
             page = context.new_page()
 
             page.goto(
                 GEM_LISTING_URL,
-                timeout=45000,
+                timeout=60000,
                 wait_until="domcontentloaded",
             )
 
             page.wait_for_timeout(
-                3000
+                4000
             )
 
             search_ui_found = False
 
             for term in search_terms:
+                # Re-resolve the input each search because dynamic UIs can recreate DOM.
                 search_input = None
 
                 selectors = [
+                    'input[placeholder*="Enter Keyword" i]',
+                    'input[placeholder*="Enter Keywords" i]',
                     'input[placeholder*="Keyword" i]',
                     'input[placeholder*="Search" i]',
                     'input[type="search"]',
@@ -2204,16 +2541,23 @@ def crawl_gem():
                         selector
                     ).first
 
-                    if (
-                        locator.count()
-                        and
-                        locator.is_visible()
-                    ):
-                        search_input = locator
-                        search_ui_found = True
-                        break
+                    try:
+                        if (
+                            locator.count()
+                            and
+                            locator.is_visible()
+                        ):
+                            search_input = locator
+                            search_ui_found = True
+                            break
+                    except Exception:
+                        continue
 
                 if search_input is None:
+                    log.warning(
+                        "GeM search field not found for term: %s",
+                        term,
+                    )
                     continue
 
                 try:
@@ -2221,13 +2565,43 @@ def crawl_gem():
                     search_input.fill(
                         term
                     )
+
+                    # Try Enter first.
                     page.keyboard.press(
                         "Enter"
                     )
 
                     page.wait_for_timeout(
-                        2500
+                        3500
                     )
+
+                    # If the page exposes a Search button, click it too.
+                    search_buttons = [
+                        'button:has-text("Search")',
+                        'input[type="submit"][value*="Search" i]',
+                        'button[aria-label*="Search" i]',
+                    ]
+
+                    for selector in search_buttons:
+                        try:
+                            button = page.locator(
+                                selector
+                            ).first
+
+                            if (
+                                button.count()
+                                and
+                                button.is_visible()
+                            ):
+                                button.click(
+                                    timeout=5000
+                                )
+                                page.wait_for_timeout(
+                                    2500
+                                )
+                                break
+                        except Exception:
+                            continue
 
                     seen_page_signatures = set()
                     seen_bid_ids = set()
@@ -2236,42 +2610,22 @@ def crawl_gem():
                         1,
                         MAX_GEM_PAGES_PER_SEARCH + 1,
                     ):
+                        page.wait_for_timeout(
+                            1500
+                        )
+
                         body_text = page.locator(
                             "body"
                         ).inner_text()
 
-                        bid_numbers = list(
-                            dict.fromkeys(
-                                re.findall(
-                                    r"GEM/\d{4}/B/\d+",
-                                    body_text,
-                                )
-                            )
+                        html = page.content()
+
+                        bid_numbers = extract_gem_bid_numbers(
+                            body_text,
+                            html,
                         )
 
-                        signature = hashlib.sha256(
-                            (
-                                "|".join(
-                                    bid_numbers
-                                )
-                                + "|"
-                                + page.url
-                            ).encode(
-                                "utf-8"
-                            )
-                        ).hexdigest()
-
-                        if signature in seen_page_signatures:
-                            log.info(
-                                "GeM | %s | repeated page detected; stopping.",
-                                term,
-                            )
-                            break
-
-                        seen_page_signatures.add(
-                            signature
-                        )
-
+                        # Collect all real rendered links.
                         anchors = page.locator(
                             "a[href]"
                         )
@@ -2281,7 +2635,7 @@ def crawl_gem():
                         for index in range(
                             min(
                                 anchors.count(),
-                                1500,
+                                2500,
                             )
                         ):
                             try:
@@ -2312,7 +2666,7 @@ def crawl_gem():
                                 if (
                                     "showbiddocument" in combined
                                     or
-                                    "bidplus" in combined
+                                    "bidplus.gem.gov.in" in combined
                                     or
                                     "gem/" in combined
                                 ):
@@ -2325,6 +2679,43 @@ def crawl_gem():
 
                             except Exception:
                                 continue
+
+                        # Also extract bid numbers from link labels.
+                        link_text_blob = "\n".join(
+                            label
+                            for label, _ in hrefs
+                            if label
+                        )
+
+                        bid_numbers = extract_gem_bid_numbers(
+                            "\n".join(
+                                bid_numbers
+                            ),
+                            link_text_blob,
+                        )
+
+                        signature = hashlib.sha256(
+                            (
+                                "|".join(
+                                    bid_numbers
+                                )
+                                + "|"
+                                + page.url
+                            ).encode(
+                                "utf-8"
+                            )
+                        ).hexdigest()
+
+                        if signature in seen_page_signatures:
+                            log.info(
+                                "GeM | %s | repeated page detected; stopping.",
+                                term,
+                            )
+                            break
+
+                        seen_page_signatures.add(
+                            signature
+                        )
 
                         new_count = 0
 
@@ -2348,20 +2739,55 @@ def crawl_gem():
                                 ).lower()
 
                                 if (
-                                    bid_no.lower()
-                                    in combined
+                                    bid_no.lower() in combined
                                     or
-                                    numeric_bid
-                                    in combined
+                                    numeric_bid in combined
                                 ):
                                     matching_urls.append(
                                         href
                                     )
 
+                            matching_urls = list(
+                                dict.fromkeys(
+                                    matching_urls
+                                )
+                            )
+
                             real_url = (
                                 matching_urls[0]
                                 if matching_urls
                                 else page.url
+                            )
+
+                            # Try to obtain a richer visible title from an anchor/card.
+                            visible_title = ""
+
+                            for label, href in hrefs:
+                                combined = (
+                                    f"{label} {href}"
+                                ).lower()
+
+                                if (
+                                    bid_no.lower() in combined
+                                    or
+                                    numeric_bid in combined
+                                ):
+                                    if (
+                                        label
+                                        and
+                                        len(label) > len(visible_title)
+                                        and
+                                        label.lower()
+                                        != bid_no.lower()
+                                    ):
+                                        visible_title = label
+
+                            title = (
+                                visible_title
+                                if valid_tender_title(
+                                    visible_title
+                                )
+                                else f"{term} | {bid_no}"
                             )
 
                             results.append(
@@ -2374,22 +2800,19 @@ def crawl_gem():
                                     source_url=GEM_LISTING_URL,
                                     tender_id=bid_no,
                                     organization="NOT VERIFIED",
-                                    title=(
-                                        f"{term} | "
-                                        f"{bid_no}"
-                                    ),
+                                    title=title[:500],
                                     category=infer_category(
-                                        term
+                                        title
                                     ),
                                     detail_url=real_url,
                                     discovered_doc_urls=(
-                                        matching_urls[:5]
-                                        if matching_urls
-                                        else []
+                                        matching_urls[:10]
                                     ),
-                                    keyword_hits=[
-                                        term
-                                    ],
+                                    keyword_hits=keyword_hits(
+                                        title
+                                        + " "
+                                        + term
+                                    ),
                                 )
                             )
 
@@ -2405,7 +2828,7 @@ def crawl_gem():
                             ),
                         )
 
-                        # Try common Next selectors.
+                        # Locate an enabled Next control.
                         next_locator = None
 
                         next_selectors = [
@@ -2415,53 +2838,57 @@ def crawl_gem():
                             'a[aria-label*="Next" i]',
                             'button[aria-label*="Next" i]',
                             'a[rel="next"]',
+                            'button[title*="Next" i]',
+                            'a[title*="Next" i]',
                         ]
 
                         for selector in next_selectors:
-                            locator = page.locator(
-                                selector
-                            ).first
-
                             try:
-                                if (
+                                locator = page.locator(
+                                    selector
+                                ).first
+
+                                if not (
                                     locator.count()
                                     and
                                     locator.is_visible()
                                 ):
-                                    disabled = (
-                                        locator.get_attribute(
-                                            "disabled"
-                                        )
-                                        is not None
-                                    )
+                                    continue
 
-                                    aria_disabled = (
-                                        (
-                                            locator.get_attribute(
-                                                "aria-disabled"
-                                            )
-                                            or ""
-                                        ).lower()
-                                        ==
-                                        "true"
+                                disabled = (
+                                    locator.get_attribute(
+                                        "disabled"
                                     )
+                                    is not None
+                                )
 
-                                    classes = (
+                                aria_disabled = (
+                                    (
                                         locator.get_attribute(
-                                            "class"
+                                            "aria-disabled"
                                         )
                                         or ""
                                     ).lower()
+                                    ==
+                                    "true"
+                                )
 
-                                    if (
-                                        disabled
-                                        or aria_disabled
-                                        or "disabled" in classes
-                                    ):
-                                        continue
+                                classes = (
+                                    locator.get_attribute(
+                                        "class"
+                                    )
+                                    or ""
+                                ).lower()
 
-                                    next_locator = locator
-                                    break
+                                if (
+                                    disabled
+                                    or aria_disabled
+                                    or "disabled" in classes
+                                ):
+                                    continue
+
+                                next_locator = locator
+                                break
 
                             except Exception:
                                 continue
@@ -2469,8 +2896,7 @@ def crawl_gem():
                         if next_locator is None:
                             break
 
-                        before_url = page.url
-                        before_text = body_text[:3000]
+                        before_signature = signature
 
                         try:
                             next_locator.click(
@@ -2478,17 +2904,36 @@ def crawl_gem():
                             )
 
                             page.wait_for_timeout(
-                                2000
+                                2500
                             )
 
-                            after_text = page.locator(
+                            after_body = page.locator(
                                 "body"
-                            ).inner_text()[:3000]
+                            ).inner_text()
+
+                            after_html = page.content()
+
+                            after_bids = extract_gem_bid_numbers(
+                                after_body,
+                                after_html,
+                            )
+
+                            after_signature = hashlib.sha256(
+                                (
+                                    "|".join(
+                                        after_bids
+                                    )
+                                    + "|"
+                                    + page.url
+                                ).encode(
+                                    "utf-8"
+                                )
+                            ).hexdigest()
 
                             if (
-                                page.url == before_url
-                                and
-                                after_text == before_text
+                                after_signature
+                                ==
+                                before_signature
                             ):
                                 break
 
@@ -2499,7 +2944,7 @@ def crawl_gem():
                     log.warning(
                         "GeM search failed for [%s]: %s",
                         term,
-                        str(error)[:200],
+                        str(error)[:300],
                     )
 
             browser.close()
@@ -2518,7 +2963,39 @@ def crawl_gem():
                 or
                 tender.stable_key()
             )
-            unique[key] = tender
+
+            # Prefer the record with the more descriptive title/real link.
+            existing = unique.get(
+                key
+            )
+
+            if existing is None:
+                unique[key] = tender
+            else:
+                score_existing = (
+                    int(
+                        bool(
+                            existing.discovered_doc_urls
+                        )
+                    )
+                    + len(
+                        existing.title or ""
+                    )
+                )
+
+                score_new = (
+                    int(
+                        bool(
+                            tender.discovered_doc_urls
+                        )
+                    )
+                    + len(
+                        tender.title or ""
+                    )
+                )
+
+                if score_new > score_existing:
+                    unique[key] = tender
 
         output = list(
             unique.values()
@@ -2539,8 +3016,8 @@ def crawl_gem():
                     ""
                     if output
                     else (
-                        "GeM page/search UI loaded, but no matching "
-                        "event/exhibition GTE bids were discovered."
+                        "Standard GeM listing loaded, but no event/exhibition "
+                        "bids were discovered for the configured searches."
                     )
                 ),
             ),
